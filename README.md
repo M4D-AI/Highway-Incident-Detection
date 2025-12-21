@@ -84,7 +84,7 @@ pip install -r requirements.txt
 ### 方式三：从 Git 仓库安装
 
 ```bash
-pip install git+https://github.com/yourusername/highway-incident-detection.git
+pip install git+https://github.com/M4D-AI/highway-incident-detection.git
 ```
 
 ### 配置
@@ -260,7 +260,7 @@ output:
 
 ## 许可证
 
-[添加许可证信息]
+[Apache License 2.0]
 
 ## 贡献
 
@@ -268,5 +268,5 @@ output:
 
 ## 联系方式
 
-[添加联系方式]
+[xiezl_cjlu@foxmail.com]
 
