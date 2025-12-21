@@ -244,8 +244,6 @@ output:
 - **资源监控**：实时监控内存、CPU使用情况，自动触发垃圾回收
 - **故障恢复**：完善的异常处理和资源清理机制
 
-详细说明请参考 [RESOURCE_MANAGEMENT.md](RESOURCE_MANAGEMENT.md)
-
 ## 性能优化
 
 - **多路流处理**：使用异步处理，支持同时处理多个RTSP流
