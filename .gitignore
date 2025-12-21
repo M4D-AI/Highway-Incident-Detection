@@ -49,6 +49,7 @@ output/
 *.jpg
 *.png
 *.json
+!data/*.mp4
 
 # Model files
 *.pt
