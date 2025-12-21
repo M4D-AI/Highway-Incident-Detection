@@ -36,7 +36,7 @@ pip install .
 ### 3. 使用 pip 从 Git 安装
 
 ```bash
-pip install git+https://github.com/yourusername/highway-incident-detection.git
+pip install git+https://github.com/M4D-AI/highway-incident-detection.git
 ```
 
 ### 4. 使用传统方式（requirements.txt）
