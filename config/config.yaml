@@ -1,0 +1,83 @@
+# Highway Incident Detection System Configuration
+
+yolo:
+  model_path: "yolov8n.pt"
+  confidence_threshold: 0.5
+  iou_threshold: 0.45
+  device: "cpu"  # "cuda", "mps" or "cpu"
+  img_size: 640
+  auto_restart: true  # Enable automatic model restart on failure
+  health_check_interval: 300  # Health check interval in seconds
+  max_failures: 5  # Maximum consecutive failures before restart
+
+event:
+  construction_vehicle_class_ids: [2, 3, 5, 7]  # car, motorcycle, bus, truck
+  worker_class_id: 0  # person
+  motorcycle_class_id: 3
+  pedestrian_class_id: 0  # person
+  debris_class_ids: [24, 25, 26, 27, 28]
+  construction_detection_frames: 10
+  reverse_detection_frames: 15
+  reverse_speed_threshold: -0.5
+  event_cooldown_seconds: 30
+  # Abnormal parking detection
+  parking_detection_frames: 60  # Frames vehicle must be stationary
+  parking_speed_threshold: 0.5  # Max speed to consider stationary
+  parking_position_threshold: 10.0  # Max position change to consider stationary
+  # Congestion detection
+  congestion_min_vehicles: 5  # Minimum number of vehicles to trigger congestion
+  congestion_speed_threshold: 2.0  # Max average speed (px/frame) to consider congestion
+  congestion_detection_frames: 30  # Frames to confirm congestion
+  congestion_density_threshold: 0.3  # Minimum vehicle density (0.0-1.0)
+
+stream:
+  streams:
+    - name: "stream_1"
+      url: "data/parking.mp4"
+      # url: "rtsp://example.com/stream1"
+      enabled: true
+      # Lane configuration for this stream (optional, overrides global lane config)
+      lane:
+        enabled: false  # Enable ROI filtering for this stream
+        # ROI polygon points: [(x1, y1), (x2, y2), (x3, y3), ...]
+        # Empty list means use full frame
+        roi_points: []  # Example: [[100, 100], [500, 100], [500, 400], [100, 400]]
+        # Lane direction: "left", "right", "up", "down", or null for bidirectional
+        direction: null
+    - name: "stream_2"
+      url: "data/trash.mp4"
+#      url: "rtsp://example.com/stream2"
+      enabled: true
+  frame_skip: 1
+  buffer_size: 30
+  reconnect_interval: 5
+  max_reconnect_attempts: -1  # -1 for infinite reconnection attempts
+  read_timeout: 10
+  heartbeat_interval: 30  # Heartbeat check interval in seconds
+  no_frame_timeout: 60  # Timeout for no frames received (seconds)
+  auto_reconnect: true  # Enable automatic reconnection
+
+output:
+  output_dir: "./output"
+  keyframe_dir: "./output/keyframes"
+  video_dir: "./output/videos"
+  summary_dir: "./output/summaries"
+  video_duration_seconds: 10
+  video_fps: 25
+
+logging:
+  log_dir: "./logs"
+  log_level: "INFO"
+  log_rotation: "100 MB"
+  log_retention: "30 days"
+  log_format: "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} | {message}"
+
+# Global lane configuration (used if stream-specific config not provided)
+lane:
+  enabled: false  # Enable lane-based detection (ROI filtering)
+  # ROI polygon points: [(x1, y1), (x2, y2), (x3, y3), ...]
+  # Empty list means use full frame
+  roi_points: []  # Example: [[100, 100], [500, 100], [500, 400], [100, 400]]
+  # Lane direction: "left", "right", "up", "down", or null for bidirectional
+  direction: null
+

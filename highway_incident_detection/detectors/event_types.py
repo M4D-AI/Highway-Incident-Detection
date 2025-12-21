@@ -14,6 +14,8 @@ class EventType(Enum):
     MOTORCYCLE = "motorcycle"
     PEDESTRIAN = "pedestrian"
     ROAD_DEBRIS = "road_debris"
+    ABNORMAL_PARKING = "abnormal_parking"
+    CONGESTION = "congestion"
 
 
 @dataclass

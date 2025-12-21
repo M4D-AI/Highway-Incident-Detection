@@ -1,6 +1,6 @@
 """Configuration settings using Pydantic."""
 
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Tuple
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -97,6 +97,44 @@ class EventConfig(BaseSettings):
         ge=0,
         description="Cooldown period between same event detections (seconds)"
     )
+    # Abnormal parking detection
+    parking_detection_frames: int = Field(
+        default=60,
+        ge=1,
+        description="Number of frames a vehicle must be stationary to trigger parking event"
+    )
+    parking_speed_threshold: float = Field(
+        default=0.5,
+        ge=0.0,
+        description="Maximum speed (pixels/frame) to consider vehicle as stationary"
+    )
+    parking_position_threshold: float = Field(
+        default=10.0,
+        ge=0.0,
+        description="Maximum position change (pixels) to consider vehicle as stationary"
+    )
+    # Congestion detection
+    congestion_min_vehicles: int = Field(
+        default=5,
+        ge=1,
+        description="Minimum number of vehicles to trigger congestion event"
+    )
+    congestion_speed_threshold: float = Field(
+        default=2.0,
+        ge=0.0,
+        description="Maximum average speed (pixels/frame) to consider as congestion"
+    )
+    congestion_detection_frames: int = Field(
+        default=30,
+        ge=1,
+        description="Number of consecutive frames to confirm congestion"
+    )
+    congestion_density_threshold: float = Field(
+        default=0.3,
+        ge=0.0,
+        le=1.0,
+        description="Minimum vehicle density (vehicles per unit area) to trigger congestion"
+    )
 
     model_config = SettingsConfigDict(extra="forbid")
 
@@ -151,6 +189,28 @@ class StreamConfig(BaseSettings):
     auto_reconnect: bool = Field(
         default=True,
         description="Enable automatic reconnection"
+    )
+
+    model_config = SettingsConfigDict(extra="forbid")
+
+
+class LaneConfig(BaseSettings):
+    """Lane configuration for ROI and direction."""
+
+    enabled: bool = Field(
+        default=False,
+        description="Enable lane-based detection (only detect events in lane ROI)"
+    )
+    # ROI region: list of points defining polygon [(x1, y1), (x2, y2), ...]
+    # Empty list means use full frame
+    roi_points: List[Tuple[int, int]] = Field(
+        default_factory=list,
+        description="ROI polygon points for lane area. Empty list = full frame"
+    )
+    # Lane direction: "left", "right", "up", "down", or None for bidirectional
+    direction: Optional[str] = Field(
+        default=None,
+        description="Lane direction: 'left', 'right', 'up', 'down', or None for bidirectional"
     )
 
     model_config = SettingsConfigDict(extra="forbid")
@@ -226,6 +286,7 @@ class Settings(BaseSettings):
     stream: StreamConfig = Field(default_factory=StreamConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    lane: LaneConfig = Field(default_factory=LaneConfig)
 
     model_config = SettingsConfigDict(
         env_file=".env",

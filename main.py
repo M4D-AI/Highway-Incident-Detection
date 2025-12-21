@@ -17,6 +17,7 @@ from highway_incident_detection.summary.summary_generator import SummaryGenerato
 from highway_incident_detection.utils.logger import setup_logger, get_logger
 from highway_incident_detection.utils.tracker import ObjectTracker
 from highway_incident_detection.utils.resource_monitor import ResourceMonitor
+from highway_incident_detection.utils.roi_filter import filter_detections_by_roi
 
 
 class HighwayIncidentDetectionSystem:
@@ -52,6 +53,10 @@ class HighwayIncidentDetectionSystem:
         # Per-stream trackers
         self.trackers: Dict[str, ObjectTracker] = {}
 
+        # Per-stream lane configurations
+        self.lane_configs: Dict[str, Dict] = {}
+        self._init_lane_configs()
+
         # Event queue for async processing
         self.event_queue: asyncio.Queue = asyncio.Queue()
 
@@ -71,6 +76,26 @@ class HighwayIncidentDetectionSystem:
         self.running = False
         self._event_loop: Optional[asyncio.AbstractEventLoop] = None
         self._monitoring_task: Optional[asyncio.Task] = None
+        self._shutdown_event: Optional[asyncio.Event] = None
+
+    def _init_lane_configs(self) -> None:
+        """Initialize lane configurations for each stream."""
+        for stream_config in self.settings.stream.streams:
+            stream_name = stream_config.get("name")
+            lane_config = stream_config.get("lane", {})
+            if lane_config:
+                self.lane_configs[stream_name] = {
+                    "enabled": lane_config.get("enabled", False),
+                    "roi_points": lane_config.get("roi_points", []),
+                    "direction": lane_config.get("direction"),
+                }
+            else:
+                # Use global lane config if stream-specific not provided
+                self.lane_configs[stream_name] = {
+                    "enabled": self.settings.lane.enabled,
+                    "roi_points": self.settings.lane.roi_points,
+                    "direction": self.settings.lane.direction,
+                }
 
     def _process_frame(
         self, stream_name: str, frame: np.ndarray, frame_number: int, timestamp: datetime
@@ -94,6 +119,13 @@ class HighwayIncidentDetectionSystem:
             # Run YOLO inference
             detections = self.yolo_model.predict(frame, verbose=False)
 
+            # Filter detections by ROI if lane config is enabled
+            lane_config = self.lane_configs.get(stream_name, {})
+            if lane_config.get("enabled", False):
+                roi_points = lane_config.get("roi_points", [])
+                if roi_points:
+                    detections = filter_detections_by_roi(detections, roi_points)
+
             # Convert detections to format for tracker
             tracker_detections = [
                 (class_id, bbox) for class_id, _, bbox in detections
@@ -111,6 +143,8 @@ class HighwayIncidentDetectionSystem:
                 stream_name=stream_name,
                 frame_number=frame_number,
                 timestamp=timestamp,
+                frame_width=frame.shape[1] if frame is not None else None,
+                frame_height=frame.shape[0] if frame is not None else None,
             )
 
             # Add frame to summary generator buffer
@@ -202,6 +236,7 @@ class HighwayIncidentDetectionSystem:
         self.logger.info("Starting Highway Incident Detection System...")
         self.running = True
         self._event_loop = asyncio.get_event_loop()
+        self._shutdown_event = asyncio.Event()
 
         # Start summary generator
         await self.summary_generator.start()
@@ -212,12 +247,32 @@ class HighwayIncidentDetectionSystem:
         # Start resource monitoring
         self._monitoring_task = asyncio.create_task(self._monitor_resources())
 
-        # Start stream processing
+        # Start stream processing in background
+        stream_task = asyncio.create_task(self.stream_processor.start())
+
         try:
-            await self.stream_processor.start()
+            # Wait for shutdown event or stream task completion
+            done, pending = await asyncio.wait(
+                [stream_task, asyncio.create_task(self._shutdown_event.wait())],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            # Cancel pending tasks
+            for task in pending:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
         except KeyboardInterrupt:
             self.logger.info("Received interrupt signal, shutting down...")
         finally:
+            # Signal shutdown
+            self.running = False
+            if self._shutdown_event:
+                self._shutdown_event.set()
+
             # Cancel monitoring task
             if self._monitoring_task:
                 self._monitoring_task.cancel()
@@ -233,6 +288,14 @@ class HighwayIncidentDetectionSystem:
             except asyncio.CancelledError:
                 pass
 
+            # Cancel stream task if still running
+            if not stream_task.done():
+                stream_task.cancel()
+                try:
+                    await stream_task
+                except asyncio.CancelledError:
+                    pass
+
             await self.shutdown()
 
     async def shutdown(self) -> None:
@@ -240,11 +303,17 @@ class HighwayIncidentDetectionSystem:
         self.logger.info("Shutting down system...")
         self.running = False
 
-        # Stop stream processor
-        await self.stream_processor.stop()
+        # Stop stream processor (with timeout)
+        try:
+            await asyncio.wait_for(self.stream_processor.stop(), timeout=5.0)
+        except asyncio.TimeoutError:
+            self.logger.warning("Stream processor stop timeout, forcing shutdown")
 
-        # Stop summary generator
-        await self.summary_generator.stop()
+        # Stop summary generator (with timeout)
+        try:
+            await asyncio.wait_for(self.summary_generator.stop(), timeout=5.0)
+        except asyncio.TimeoutError:
+            self.logger.warning("Summary generator stop timeout, forcing shutdown")
 
         self.logger.info("System shutdown complete")
 

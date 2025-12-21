@@ -31,6 +31,18 @@ class EventDetector:
         self.reverse_tracks: Dict[str, Dict[int, deque]] = defaultdict(
             lambda: defaultdict(lambda: deque(maxlen=20))
         )
+        # Parking detection: track vehicle positions over time
+        self.parking_tracks: Dict[str, Dict[int, deque]] = defaultdict(
+            lambda: defaultdict(lambda: deque(maxlen=100))
+        )
+        # Congestion detection: track vehicle counts and speeds
+        self.congestion_history: Dict[str, deque] = defaultdict(
+            lambda: deque(maxlen=100)
+        )
+        # Congestion detection: track vehicle counts and speeds
+        self.congestion_history: Dict[str, deque] = defaultdict(
+            lambda: deque(maxlen=100)
+        )
 
     def _is_in_cooldown(
         self, stream_name: str, event_type: EventType, current_time: datetime
@@ -316,6 +328,232 @@ class EventDetector:
 
         return None
 
+    def detect_abnormal_parking(
+        self,
+        tracked_objects: Dict[int, TrackedObject],
+        stream_name: str,
+        frame_number: int,
+        timestamp: datetime,
+    ) -> Optional[IncidentEvent]:
+        """Detect abnormal parking events (vehicles stationary for too long).
+
+        Args:
+            tracked_objects: Dictionary of tracked objects.
+            stream_name: Name of the stream.
+            frame_number: Current frame number.
+            timestamp: Current timestamp.
+
+        Returns:
+            IncidentEvent if abnormal parking detected, None otherwise.
+        """
+        if self._is_in_cooldown(stream_name, EventType.ABNORMAL_PARKING, timestamp):
+            return None
+
+        # Track vehicle positions
+        for track_id, obj in tracked_objects.items():
+            # Only track vehicles (class IDs 2, 3, 5, 7)
+            if obj.class_id not in [2, 3, 5, 7]:
+                continue
+
+            # Calculate speed magnitude
+            speed = np.sqrt(obj.velocity[0] ** 2 + obj.velocity[1] ** 2)
+
+            # Store position and speed history
+            self.parking_tracks[stream_name][track_id].append({
+                "center": obj.center,
+                "speed": speed,
+                "frame": frame_number,
+            })
+
+            # Check if vehicle has been stationary for too long
+            track_history = list(self.parking_tracks[stream_name][track_id])
+            if len(track_history) >= self.config.parking_detection_frames:
+                # Check if vehicle is stationary
+                recent_positions = track_history[-self.config.parking_detection_frames:]
+                speeds = [item["speed"] for item in recent_positions]
+
+                # Check average speed
+                avg_speed = np.mean(speeds)
+                if avg_speed > self.config.parking_speed_threshold:
+                    continue  # Vehicle is moving
+
+                # Check position stability
+                positions = [item["center"] for item in recent_positions]
+                first_pos = positions[0]
+                last_pos = positions[-1]
+                position_change = np.sqrt(
+                    (last_pos[0] - first_pos[0]) ** 2 + (last_pos[1] - first_pos[1]) ** 2
+                )
+
+                if position_change > self.config.parking_position_threshold:
+                    continue  # Vehicle has moved significantly
+
+                # Vehicle is stationary for too long - abnormal parking detected
+                self._update_event_time(stream_name, EventType.ABNORMAL_PARKING, timestamp)
+                return IncidentEvent(
+                    event_type=EventType.ABNORMAL_PARKING,
+                    stream_name=stream_name,
+                    timestamp=timestamp,
+                    frame_number=frame_number,
+                    confidence=0.85,  # Based on consistent stationary behavior
+                    bbox=obj.bbox,
+                    description=f"Abnormal parking detected (track_id: {track_id}, stationary for {len(recent_positions)} frames)",
+                    metadata={
+                        "track_id": track_id,
+                        "average_speed": float(avg_speed),
+                        "position_change": float(position_change),
+                        "stationary_frames": len(recent_positions),
+                    },
+                )
+
+        return None
+
+    def detect_congestion(
+        self,
+        detections: List[Tuple[int, float, Tuple[float, float, float, float]]],
+        tracked_objects: Dict[int, TrackedObject],
+        stream_name: str,
+        frame_number: int,
+        timestamp: datetime,
+        frame_width: Optional[int] = None,
+        frame_height: Optional[int] = None,
+    ) -> Optional[IncidentEvent]:
+        """Detect traffic congestion events.
+
+        Args:
+            detections: List of (class_id, confidence, bbox) detections.
+            tracked_objects: Dictionary of tracked objects.
+            stream_name: Name of the stream.
+            frame_number: Current frame number.
+            timestamp: Current timestamp.
+            frame_width: Frame width for density calculation (optional).
+            frame_height: Frame height for density calculation (optional).
+
+        Returns:
+            IncidentEvent if congestion detected, None otherwise.
+        """
+        if self._is_in_cooldown(stream_name, EventType.CONGESTION, timestamp):
+            return None
+
+        # Filter vehicles only (class IDs 2, 3, 5, 7: car, motorcycle, bus, truck)
+        vehicle_detections = [
+            d for d in detections
+            if d[0] in [2, 3, 5, 7]
+        ]
+
+        if len(vehicle_detections) < self.config.congestion_min_vehicles:
+            # Reset congestion history if not enough vehicles
+            self.congestion_history[stream_name].clear()
+            return None
+
+        # Calculate average speed of tracked vehicles
+        vehicle_speeds = []
+        for track_id, obj in tracked_objects.items():
+            if obj.class_id in [2, 3, 5, 7]:  # Only vehicles
+                speed = np.sqrt(obj.velocity[0] ** 2 + obj.velocity[1] ** 2)
+                vehicle_speeds.append(speed)
+
+        avg_speed = np.mean(vehicle_speeds) if vehicle_speeds else float('inf')
+
+        # Calculate vehicle density if frame dimensions provided
+        density = 0.0
+        if frame_width and frame_height:
+            frame_area = frame_width * frame_height
+            if frame_area > 0:
+                # Approximate vehicle area (sum of bbox areas)
+                vehicle_area = sum(
+                    (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+                    for _, _, bbox in vehicle_detections
+                )
+                density = vehicle_area / frame_area
+
+        # Record congestion metrics
+        congestion_metrics = {
+            "vehicle_count": len(vehicle_detections),
+            "avg_speed": float(avg_speed),
+            "density": float(density),
+            "frame": frame_number,
+        }
+        self.congestion_history[stream_name].append(congestion_metrics)
+
+        # Check if congestion conditions are met
+        history = list(self.congestion_history[stream_name])
+        if len(history) >= self.config.congestion_detection_frames:
+            recent_history = history[-self.config.congestion_detection_frames:]
+
+            # Check if consistently congested
+            congested_frames = 0
+            total_vehicles = 0
+            total_speed = 0.0
+            total_density = 0.0
+
+            for metrics in recent_history:
+                total_vehicles += metrics["vehicle_count"]
+                total_speed += metrics["avg_speed"]
+                total_density += metrics["density"]
+
+                # Check if this frame meets congestion criteria
+                if (
+                    metrics["vehicle_count"] >= self.config.congestion_min_vehicles
+                    and metrics["avg_speed"] <= self.config.congestion_speed_threshold
+                    and (
+                        not frame_width or not frame_height
+                        or metrics["density"] >= self.config.congestion_density_threshold
+                    )
+                ):
+                    congested_frames += 1
+
+            # Calculate averages
+            avg_vehicle_count = total_vehicles / len(recent_history)
+            avg_speed_over_time = total_speed / len(recent_history)
+            avg_density_over_time = total_density / len(recent_history)
+
+            # Congestion threshold: at least 80% of frames meet criteria
+            congestion_ratio = congested_frames / len(recent_history)
+            if congestion_ratio >= 0.8:
+                # Calculate representative bbox (center of all vehicles)
+                if vehicle_detections:
+                    all_x = []
+                    all_y = []
+                    for _, _, bbox in vehicle_detections:
+                        all_x.extend([bbox[0], bbox[2]])
+                        all_y.extend([bbox[1], bbox[3]])
+
+                    if all_x and all_y:
+                        center_bbox = (
+                            min(all_x),
+                            min(all_y),
+                            max(all_x),
+                            max(all_y),
+                        )
+                    else:
+                        center_bbox = vehicle_detections[0][2]
+                else:
+                    center_bbox = None
+
+                self._update_event_time(stream_name, EventType.CONGESTION, timestamp)
+                return IncidentEvent(
+                    event_type=EventType.CONGESTION,
+                    stream_name=stream_name,
+                    timestamp=timestamp,
+                    frame_number=frame_number,
+                    confidence=min(0.95, 0.7 + congestion_ratio * 0.25),
+                    bbox=center_bbox,
+                    description=(
+                        f"Traffic congestion detected: {int(avg_vehicle_count)} vehicles, "
+                        f"avg speed {avg_speed_over_time:.2f} px/frame"
+                    ),
+                    metadata={
+                        "vehicle_count": int(avg_vehicle_count),
+                        "avg_speed": float(avg_speed_over_time),
+                        "density": float(avg_density_over_time),
+                        "congestion_ratio": float(congestion_ratio),
+                        "congested_frames": congested_frames,
+                    },
+                )
+
+        return None
+
     def process_frame(
         self,
         detections: List[Tuple[int, float, Tuple[float, float, float, float]]],
@@ -323,6 +561,8 @@ class EventDetector:
         stream_name: str,
         frame_number: int,
         timestamp: datetime,
+        frame_width: Optional[int] = None,
+        frame_height: Optional[int] = None,
     ) -> List[IncidentEvent]:
         """Process frame and detect all events.
 
@@ -368,6 +608,24 @@ class EventDetector:
         )
         if debris_event:
             events.append(debris_event)
+
+        parking_event = self.detect_abnormal_parking(
+            tracked_objects, stream_name, frame_number, timestamp
+        )
+        if parking_event:
+            events.append(parking_event)
+
+        congestion_event = self.detect_congestion(
+            detections,
+            tracked_objects,
+            stream_name,
+            frame_number,
+            timestamp,
+            frame_width,
+            frame_height,
+        )
+        if congestion_event:
+            events.append(congestion_event)
 
         return events
 

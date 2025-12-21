@@ -41,8 +41,10 @@ def main():
     # Setup signal handlers
     def signal_handler(sig, frame):
         """Handle interrupt signals."""
-        system.logger.info("Received interrupt signal")
+        system.logger.info("Received interrupt signal, initiating shutdown...")
         system.running = False
+        if system._shutdown_event:
+            system._shutdown_event.set()
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
