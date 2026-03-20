@@ -43,12 +43,8 @@ ENV/
 logs/
 *.log
 
-# Output
-output/
-*.mp4
-*.jpg
-*.png
-*.json
+# Output artifacts
+/output/
 !data/*.mp4
 
 # Model files
@@ -71,4 +67,3 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
-

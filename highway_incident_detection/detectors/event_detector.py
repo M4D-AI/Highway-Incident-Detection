@@ -1,12 +1,48 @@
 """Event detection logic."""
 
-from typing import List, Dict, Tuple, Optional
+from dataclasses import dataclass
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 from collections import defaultdict, deque
 from datetime import datetime
 import numpy as np
-from highway_incident_detection.detectors.event_types import EventType, IncidentEvent
+from highway_incident_detection.detectors.event_types import (
+    EventType,
+    EventTypeLike,
+    IncidentEvent,
+    event_type_name,
+)
 from highway_incident_detection.config.settings import EventConfig
 from highway_incident_detection.utils.tracker import TrackedObject
+from highway_incident_detection.utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+
+@dataclass
+class EventDetectionContext:
+    """Context passed to registered event detectors."""
+
+    detections: List[Tuple[int, float, Tuple[float, float, float, float]]]
+    tracked_objects: Dict[int, TrackedObject]
+    stream_name: str
+    frame_number: int
+    timestamp: datetime
+    frame_width: Optional[int] = None
+    frame_height: Optional[int] = None
+
+
+DetectorOutput = Optional[Union[IncidentEvent, Sequence[IncidentEvent]]]
+EventDetectorHandler = Callable[["EventDetector", EventDetectionContext], DetectorOutput]
+
+
+@dataclass
+class RegisteredEventDetector:
+    """One registered event detector entry."""
+
+    name: str
+    event_type: EventTypeLike
+    handler: EventDetectorHandler
+    built_in: bool = False
 
 
 class EventDetector:
@@ -23,7 +59,7 @@ class EventDetector:
         self.config = config
 
         # Event state tracking
-        self.last_event_time: Dict[Tuple[str, EventType], datetime] = {}
+        self.last_event_time: Dict[Tuple[str, str], datetime] = {}
         self.construction_frame_count: Dict[str, int] = defaultdict(int)
         self.reverse_tracks: Dict[str, Dict[int, deque]] = defaultdict(
             lambda: defaultdict(lambda: deque(maxlen=20))
@@ -36,6 +72,123 @@ class EventDetector:
         self.congestion_history: Dict[str, deque] = defaultdict(
             lambda: deque(maxlen=100)
         )
+        self._registered_detectors: List[RegisteredEventDetector] = []
+        self._register_builtin_detectors()
+
+    def _register_builtin_detectors(self) -> None:
+        """Register the built-in event detectors."""
+        self.register_detector(
+            name="construction",
+            event_type=EventType.CONSTRUCTION,
+            handler=lambda detector, ctx: detector.detect_construction(
+                ctx.detections,
+                ctx.stream_name,
+                ctx.frame_number,
+                ctx.timestamp,
+            ),
+            built_in=True,
+        )
+        self.register_detector(
+            name="reverse_vehicle",
+            event_type=EventType.REVERSE_VEHICLE,
+            handler=lambda detector, ctx: detector.detect_reverse_vehicle(
+                ctx.tracked_objects,
+                ctx.stream_name,
+                ctx.frame_number,
+                ctx.timestamp,
+            ),
+            built_in=True,
+        )
+        self.register_detector(
+            name="motorcycle",
+            event_type=EventType.MOTORCYCLE,
+            handler=lambda detector, ctx: detector.detect_motorcycle(
+                ctx.detections,
+                ctx.stream_name,
+                ctx.frame_number,
+                ctx.timestamp,
+            ),
+            built_in=True,
+        )
+        self.register_detector(
+            name="pedestrian",
+            event_type=EventType.PEDESTRIAN,
+            handler=lambda detector, ctx: detector.detect_pedestrian(
+                ctx.detections,
+                ctx.stream_name,
+                ctx.frame_number,
+                ctx.timestamp,
+            ),
+            built_in=True,
+        )
+        self.register_detector(
+            name="road_debris",
+            event_type=EventType.ROAD_DEBRIS,
+            handler=lambda detector, ctx: detector.detect_road_debris(
+                ctx.detections,
+                ctx.stream_name,
+                ctx.frame_number,
+                ctx.timestamp,
+            ),
+            built_in=True,
+        )
+        self.register_detector(
+            name="abnormal_parking",
+            event_type=EventType.ABNORMAL_PARKING,
+            handler=lambda detector, ctx: detector.detect_abnormal_parking(
+                ctx.tracked_objects,
+                ctx.stream_name,
+                ctx.frame_number,
+                ctx.timestamp,
+            ),
+            built_in=True,
+        )
+        self.register_detector(
+            name="congestion",
+            event_type=EventType.CONGESTION,
+            handler=lambda detector, ctx: detector.detect_congestion(
+                ctx.detections,
+                ctx.tracked_objects,
+                ctx.stream_name,
+                ctx.frame_number,
+                ctx.timestamp,
+                ctx.frame_width,
+                ctx.frame_height,
+            ),
+            built_in=True,
+        )
+
+    def register_detector(
+        self,
+        name: str,
+        event_type: EventTypeLike,
+        handler: EventDetectorHandler,
+        *,
+        built_in: bool = False,
+        prepend: bool = False,
+    ) -> None:
+        """Register a custom or built-in event detector."""
+        self.unregister_detector(name)
+        entry = RegisteredEventDetector(
+            name=name,
+            event_type=event_type,
+            handler=handler,
+            built_in=built_in,
+        )
+        if prepend:
+            self._registered_detectors.insert(0, entry)
+        else:
+            self._registered_detectors.append(entry)
+
+    def unregister_detector(self, name: str) -> None:
+        """Remove a detector by name if present."""
+        self._registered_detectors = [
+            detector for detector in self._registered_detectors if detector.name != name
+        ]
+
+    def list_detectors(self) -> List[RegisteredEventDetector]:
+        """Return the registered detectors in execution order."""
+        return list(self._registered_detectors)
 
     def _prune_track_state(self, stream_name: str, active_track_ids: List[int]) -> None:
         """Remove stale per-track state for disappeared objects."""
@@ -46,7 +199,7 @@ class EventDetector:
                 del state_map[track_id]
 
     def _is_in_cooldown(
-        self, stream_name: str, event_type: EventType, current_time: datetime
+        self, stream_name: str, event_type: EventTypeLike, current_time: datetime
     ) -> bool:
         """Check if event is in cooldown period.
 
@@ -58,7 +211,7 @@ class EventDetector:
         Returns:
             True if in cooldown, False otherwise.
         """
-        key = (stream_name, event_type)
+        key = (stream_name, event_type_name(event_type))
         if key not in self.last_event_time:
             return False
 
@@ -66,7 +219,7 @@ class EventDetector:
         return time_diff.total_seconds() < self.config.event_cooldown_seconds
 
     def _update_event_time(
-        self, stream_name: str, event_type: EventType, current_time: datetime
+        self, stream_name: str, event_type: EventTypeLike, current_time: datetime
     ) -> None:
         """Update last event time.
 
@@ -75,8 +228,49 @@ class EventDetector:
             event_type: Type of event.
             current_time: Current timestamp.
         """
-        key = (stream_name, event_type)
+        key = (stream_name, event_type_name(event_type))
         self.last_event_time[key] = current_time
+
+    def is_in_cooldown(
+        self,
+        stream_name: str,
+        event_type: EventTypeLike,
+        current_time: datetime,
+    ) -> bool:
+        """Public cooldown helper for custom detectors."""
+        return self._is_in_cooldown(stream_name, event_type, current_time)
+
+    def update_event_time(
+        self,
+        stream_name: str,
+        event_type: EventTypeLike,
+        current_time: datetime,
+    ) -> None:
+        """Public cooldown-state update helper for custom detectors."""
+        self._update_event_time(stream_name, event_type, current_time)
+
+    def create_event(
+        self,
+        event_type: EventTypeLike,
+        stream_name: str,
+        timestamp: datetime,
+        frame_number: int,
+        confidence: float,
+        bbox: Optional[Tuple[float, float, float, float]] = None,
+        description: str = "",
+        metadata: Optional[Dict[str, object]] = None,
+    ) -> IncidentEvent:
+        """Build a normalized incident event for built-in or custom detectors."""
+        return IncidentEvent(
+            event_type=event_type,
+            stream_name=stream_name,
+            timestamp=timestamp,
+            frame_number=frame_number,
+            confidence=confidence,
+            bbox=bbox,
+            description=description,
+            metadata=metadata or {},
+        )
 
     def detect_construction(
         self,
@@ -579,55 +773,30 @@ class EventDetector:
         Returns:
             List of detected events.
         """
-        events = []
-
-        # Detect all event types
-        construction_event = self.detect_construction(
-            detections, stream_name, frame_number, timestamp
+        context = EventDetectionContext(
+            detections=detections,
+            tracked_objects=tracked_objects,
+            stream_name=stream_name,
+            frame_number=frame_number,
+            timestamp=timestamp,
+            frame_width=frame_width,
+            frame_height=frame_height,
         )
-        if construction_event:
-            events.append(construction_event)
+        events: List[IncidentEvent] = []
+        for registered_detector in self._registered_detectors:
+            try:
+                detector_output = registered_detector.handler(self, context)
+            except Exception as e:
+                logger.error(
+                    f"Detector '{registered_detector.name}' failed on "
+                    f"{stream_name} frame {frame_number}: {e}"
+                )
+                continue
 
-        reverse_event = self.detect_reverse_vehicle(
-            tracked_objects, stream_name, frame_number, timestamp
-        )
-        if reverse_event:
-            events.append(reverse_event)
-
-        motorcycle_event = self.detect_motorcycle(
-            detections, stream_name, frame_number, timestamp
-        )
-        if motorcycle_event:
-            events.append(motorcycle_event)
-
-        pedestrian_event = self.detect_pedestrian(
-            detections, stream_name, frame_number, timestamp
-        )
-        if pedestrian_event:
-            events.append(pedestrian_event)
-
-        debris_event = self.detect_road_debris(
-            detections, stream_name, frame_number, timestamp
-        )
-        if debris_event:
-            events.append(debris_event)
-
-        parking_event = self.detect_abnormal_parking(
-            tracked_objects, stream_name, frame_number, timestamp
-        )
-        if parking_event:
-            events.append(parking_event)
-
-        congestion_event = self.detect_congestion(
-            detections,
-            tracked_objects,
-            stream_name,
-            frame_number,
-            timestamp,
-            frame_width,
-            frame_height,
-        )
-        if congestion_event:
-            events.append(congestion_event)
-
+            if detector_output is None:
+                continue
+            if isinstance(detector_output, IncidentEvent):
+                events.append(detector_output)
+                continue
+            events.extend(detector_output)
         return events

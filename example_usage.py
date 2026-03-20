@@ -4,38 +4,27 @@ This script demonstrates how to use the system programmatically.
 """
 
 import asyncio
-from highway_incident_detection.config.settings import Settings
-from highway_incident_detection.models.yolo_model import YOLOModel
-from highway_incident_detection.detectors.event_detector import EventDetector
-from highway_incident_detection.utils.logger import setup_logger, get_logger
+from highway_incident_detection import (
+    EventResult,
+    HTTPWebhookHandler,
+    HighwayIncidentDetectionSystem,
+)
+
+
+async def handle_result(result: EventResult) -> None:
+    """Custom downstream processing hook."""
+    print("received result:", result.to_dict())
 
 
 async def example_detection():
-    """Example of using the detection components."""
-    # Load settings
-    settings = Settings()
-
-    # Setup logger
-    setup_logger(
-        log_dir=settings.logging.log_dir,
-        log_level=settings.logging.log_level,
+    """Example of subscribing to output results."""
+    system = HighwayIncidentDetectionSystem(config_path="config/config.yaml")
+    system.register_result_handler(handle_result)
+    system.register_result_handler(
+        HTTPWebhookHandler("http://127.0.0.1:8080/webhook")
     )
-    logger = get_logger(__name__)
-
-    # Initialize YOLO model
-    logger.info("Initializing YOLO model...")
-    yolo_model = YOLOModel(settings.yolo)
-
-    # Initialize event detector
-    logger.info("Initializing event detector...")
-    event_detector = EventDetector(settings.event)
-
-    # Example: Process a single image
-    # (In real usage, frames come from RTSP streams)
-    logger.info("Example: Detection components initialized successfully")
-    logger.info("To process video streams, use main.py with RTSP configuration")
+    await system.run()
 
 
 if __name__ == "__main__":
     asyncio.run(example_detection())
-

@@ -1,7 +1,9 @@
 """Asynchronous summary generation module."""
 
 import asyncio
+import inspect
 import json
+import threading
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from datetime import datetime
@@ -12,6 +14,7 @@ import aiofiles
 from highway_incident_detection.audit.event_auditor import EventAuditor
 from highway_incident_detection.detectors.event_types import IncidentEvent
 from highway_incident_detection.config.settings import OutputConfig
+from highway_incident_detection.output.result_output import EventResult, ResultHandler
 from highway_incident_detection.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -20,16 +23,24 @@ logger = get_logger(__name__)
 class SummaryGenerator:
     """Generate summaries, keyframes, and videos asynchronously."""
 
-    def __init__(self, config: OutputConfig, auditor: Optional[EventAuditor] = None):
+    def __init__(
+        self,
+        config: OutputConfig,
+        auditor: Optional[EventAuditor] = None,
+        result_handlers: Optional[List[ResultHandler]] = None,
+    ):
         """Initialize summary generator.
 
         Args:
             config: Output configuration.
             auditor: Optional event auditor for secondary verification.
+            result_handlers: Optional downstream result handlers.
         """
         self.config = config
         self.auditor = auditor
+        self.result_handlers = list(result_handlers or [])
         self._create_directories()
+        self._buffer_lock = threading.Lock()
 
         # Frame buffers for video generation (stream_name -> deque of frames)
         self.frame_buffers: Dict[str, deque] = {}
@@ -64,16 +75,40 @@ class SummaryGenerator:
             frame_number: Frame number.
             timestamp: Frame timestamp.
         """
-        if stream_name not in self.frame_buffers:
-            # Calculate buffer size based on video duration and FPS
-            buffer_size = self.config.video_duration_seconds * self.config.video_fps
-            self.frame_buffers[stream_name] = deque(maxlen=buffer_size)
-            self.frame_timestamps[stream_name] = deque(maxlen=buffer_size)
-            self.frame_numbers[stream_name] = deque(maxlen=buffer_size)
+        with self._buffer_lock:
+            if stream_name not in self.frame_buffers:
+                # Calculate buffer size based on video duration and FPS
+                buffer_size = self.config.video_duration_seconds * self.config.video_fps
+                self.frame_buffers[stream_name] = deque(maxlen=buffer_size)
+                self.frame_timestamps[stream_name] = deque(maxlen=buffer_size)
+                self.frame_numbers[stream_name] = deque(maxlen=buffer_size)
 
-        self.frame_buffers[stream_name].append(frame)
-        self.frame_timestamps[stream_name].append(timestamp)
-        self.frame_numbers[stream_name].append(frame_number)
+            self.frame_buffers[stream_name].append(frame)
+            self.frame_timestamps[stream_name].append(timestamp)
+            self.frame_numbers[stream_name].append(frame_number)
+
+    def _snapshot_stream_frames(
+        self,
+        stream_name: str,
+    ) -> Optional[Dict[str, List[Any]]]:
+        """Take a consistent snapshot of buffered frames for one stream."""
+        with self._buffer_lock:
+            if stream_name not in self.frame_buffers:
+                return None
+
+            return {
+                "frames": list(self.frame_buffers[stream_name]),
+                "frame_numbers": list(self.frame_numbers[stream_name]),
+                "timestamps": list(self.frame_timestamps[stream_name]),
+            }
+
+    def add_result_handler(self, handler: ResultHandler) -> None:
+        """Register a downstream result handler."""
+        self.result_handlers.append(handler)
+
+    def remove_result_handler(self, handler: ResultHandler) -> None:
+        """Remove a downstream result handler if present."""
+        self.result_handlers = [item for item in self.result_handlers if item != handler]
 
     async def generate_keyframe(
         self, event: IncidentEvent, frame: np.ndarray
@@ -91,7 +126,7 @@ class SummaryGenerator:
             # Create filename
             timestamp_str = event.timestamp.strftime("%Y%m%d_%H%M%S")
             filename = (
-                f"{event.stream_name}_{event.event_type.value}_{timestamp_str}_"
+                f"{event.stream_name}_{event.event_type_value}_{timestamp_str}_"
                 f"frame{event.frame_number}.jpg"
             )
             filepath = Path(self.config.keyframe_dir) / filename
@@ -103,7 +138,7 @@ class SummaryGenerator:
                 cv2.rectangle(output_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                 cv2.putText(
                     output_frame,
-                    f"{event.event_type.value} ({event.confidence:.2f})",
+                    f"{event.event_type_value} ({event.confidence:.2f})",
                     (x1, y1 - 10),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.7,
@@ -139,7 +174,7 @@ class SummaryGenerator:
             # Create filename
             timestamp_str = event.timestamp.strftime("%Y%m%d_%H%M%S")
             filename = (
-                f"{event.stream_name}_{event.event_type.value}_{timestamp_str}_"
+                f"{event.stream_name}_{event.event_type_value}_{timestamp_str}_"
                 f"frame{event.frame_number}.mp4"
             )
             filepath = Path(self.config.video_dir) / filename
@@ -196,8 +231,8 @@ class SummaryGenerator:
         try:
             # Create summary data
             summary = {
-                "event_id": f"{event.stream_name}_{event.event_type.value}_{event.timestamp.isoformat()}",
-                "event_type": event.event_type.value,
+                "event_id": f"{event.stream_name}_{event.event_type_value}_{event.timestamp.isoformat()}",
+                "event_type": event.event_type_value,
                 "stream_name": event.stream_name,
                 "timestamp": event.timestamp.isoformat(),
                 "frame_number": event.frame_number,
@@ -213,7 +248,7 @@ class SummaryGenerator:
             # Create filename
             timestamp_str = event.timestamp.strftime("%Y%m%d_%H%M%S")
             filename = (
-                f"{event.stream_name}_{event.event_type.value}_{timestamp_str}_"
+                f"{event.stream_name}_{event.event_type_value}_{timestamp_str}_"
                 f"frame{event.frame_number}.json"
             )
             filepath = Path(self.config.summary_dir) / filename
@@ -238,17 +273,17 @@ class SummaryGenerator:
         try:
             timestamp_str = event.timestamp.strftime("%Y%m%d_%H%M%S")
             filename = (
-                f"{event.stream_name}_{event.event_type.value}_{timestamp_str}_"
+                f"{event.stream_name}_{event.event_type_value}_{timestamp_str}_"
                 f"frame{event.frame_number}.audit.json"
             )
             filepath = Path(self.config.audit_dir) / filename
             payload = {
                 "event_id": (
-                    f"{event.stream_name}_{event.event_type.value}_"
+                    f"{event.stream_name}_{event.event_type_value}_"
                     f"{event.timestamp.isoformat()}"
                 ),
                 "stream_name": event.stream_name,
-                "event_type": event.event_type.value,
+                "event_type": event.event_type_value,
                 "timestamp": event.timestamp.isoformat(),
                 "frame_number": event.frame_number,
                 "audit": audit_result,
@@ -270,11 +305,13 @@ class SummaryGenerator:
         try:
             # Get frames from buffer
             stream_name = event.stream_name
-            if stream_name not in self.frame_buffers:
+            snapshot = self._snapshot_stream_frames(stream_name)
+            if snapshot is None:
                 logger.warning(f"No frame buffer found for stream {stream_name}")
                 return
 
-            frames = list(self.frame_buffers[stream_name])
+            frames = snapshot["frames"]
+            frame_numbers = snapshot["frame_numbers"]
             if not frames:
                 logger.warning(f"No frames in buffer for stream {stream_name}")
                 return
@@ -282,7 +319,7 @@ class SummaryGenerator:
             # Get the frame at event time (or closest)
             event_frame = None
             event_frame_idx = -1
-            for i, frame_num in enumerate(self.frame_numbers[stream_name]):
+            for i, frame_num in enumerate(frame_numbers):
                 if frame_num == event.frame_number:
                     event_frame = frames[i]
                     event_frame_idx = i
@@ -309,19 +346,67 @@ class SummaryGenerator:
 
             video_path = await self.generate_video(event, video_frames)
 
+            event_id = (
+                f"{event.stream_name}_{event.event_type_value}_{event.timestamp.isoformat()}"
+            )
             audit_summary: Optional[Dict[str, Any]] = None
+            audit_path = ""
             if self.auditor and self.auditor.enabled:
                 audit = await self.auditor.audit_event(event, keyframe_path, video_path)
                 audit_summary = audit.to_dict(
                     include_raw_response=self.auditor.config.save_raw_response
                 )
-                await self.generate_audit_record(event, audit_summary)
+                audit_path = await self.generate_audit_record(event, audit_summary)
 
             # Generate summary
-            await self.generate_summary(event, keyframe_path, video_path, audit_summary)
+            summary_path = await self.generate_summary(
+                event,
+                keyframe_path,
+                video_path,
+                audit_summary,
+            )
+            await self._emit_result(
+                EventResult(
+                    event=event,
+                    event_id=event_id,
+                    keyframe_path=keyframe_path,
+                    video_path=video_path,
+                    summary_path=summary_path,
+                    audit_path=audit_path,
+                    audit=audit_summary,
+                )
+            )
 
         except Exception as e:
             logger.error(f"Error processing event: {e}")
+
+    async def _emit_result(self, result: EventResult) -> None:
+        """Emit the completed event result to registered downstream handlers."""
+        if not self.result_handlers:
+            return
+
+        tasks = [
+            asyncio.create_task(self._invoke_result_handler(handler, result))
+            for handler in self.result_handlers
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for handler_result in results:
+            if isinstance(handler_result, Exception):
+                logger.error(f"Result handler execution failed: {handler_result}")
+
+    async def _invoke_result_handler(
+        self,
+        handler: ResultHandler,
+        result: EventResult,
+    ) -> None:
+        """Invoke one result handler without blocking the event loop."""
+        if inspect.iscoroutinefunction(handler) or inspect.iscoroutinefunction(
+            getattr(handler, "__call__", None)
+        ):
+            await handler(result)
+            return
+
+        await asyncio.to_thread(handler, result)
 
     async def _process_event_queue(self) -> None:
         """Process events from queue asynchronously."""

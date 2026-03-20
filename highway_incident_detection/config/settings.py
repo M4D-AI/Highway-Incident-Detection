@@ -135,6 +135,34 @@ class EventConfig(BaseSettings):
         le=1.0,
         description="Minimum vehicle density (vehicles per unit area) to trigger congestion"
     )
+    custom_detectors: List["CustomEventDetectorConfig"] = Field(
+        default_factory=list,
+        description="Custom detector registrations loaded from module:callable paths"
+    )
+
+    model_config = SettingsConfigDict(extra="forbid")
+
+
+class CustomEventDetectorConfig(BaseSettings):
+    """Custom detector registration config."""
+
+    name: str = Field(
+        description="Unique detector name"
+    )
+    event_type: str = Field(
+        description="Event type string emitted by the custom detector"
+    )
+    handler: str = Field(
+        description="Callable path in module:callable format"
+    )
+    enabled: bool = Field(
+        default=True,
+        description="Whether this custom detector should be loaded"
+    )
+    prepend: bool = Field(
+        default=False,
+        description="Whether to run this detector before built-in detectors"
+    )
 
     model_config = SettingsConfigDict(extra="forbid")
 
@@ -189,6 +217,15 @@ class StreamConfig(BaseSettings):
     auto_reconnect: bool = Field(
         default=True,
         description="Enable automatic reconnection"
+    )
+    max_pending_frames: int = Field(
+        default=2,
+        ge=1,
+        description="Maximum in-flight frame processing tasks per stream"
+    )
+    drop_frames_when_busy: bool = Field(
+        default=True,
+        description="Drop new frames when in-flight processing reaches the limit"
     )
 
     model_config = SettingsConfigDict(extra="forbid")
@@ -360,6 +397,9 @@ class Settings(BaseSettings):
         with open(yaml_path, "r", encoding="utf-8") as f:
             config_dict = yaml.safe_load(f)
         return cls(**config_dict)
+
+
+EventConfig.model_rebuild()
 
 
 _settings: Settings = None

@@ -2,7 +2,7 @@
 
 import asyncio
 import inspect
-from typing import Callable, Dict, Any
+from typing import Any, Callable, Dict, Set
 from datetime import datetime
 import cv2
 import numpy as np
@@ -36,6 +36,8 @@ class RTSPStreamProcessor:
         self.last_frame_time: Dict[str, datetime] = {}
         self.heartbeat_tasks: Dict[str, asyncio.Task] = {}
         self.reconnect_attempts: Dict[str, int] = {}
+        self.callback_tasks: Dict[str, Set[asyncio.Task]] = {}
+        self.dropped_frames: Dict[str, int] = {}
 
     def _cleanup_capture(self, stream_name: str) -> None:
         """Clean up video capture for a stream.
@@ -136,6 +138,63 @@ class RTSPStreamProcessor:
             except Exception as e:
                 logger.error(f"Error in heartbeat check for {stream_name}: {e}")
 
+    def _track_callback_task(self, stream_name: str, task: asyncio.Task) -> None:
+        """Track an in-flight frame callback task."""
+        pending_tasks = self.callback_tasks.setdefault(stream_name, set())
+        pending_tasks.add(task)
+
+        def _cleanup(done_task: asyncio.Task) -> None:
+            pending_tasks.discard(done_task)
+            try:
+                done_task.result()
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.error(f"Unhandled frame callback error for {stream_name}: {e}")
+
+        task.add_done_callback(_cleanup)
+
+    async def _dispatch_frame_callback(
+        self,
+        stream_name: str,
+        frame: np.ndarray,
+        frame_number: int,
+        timestamp: datetime,
+    ) -> None:
+        """Dispatch frame processing without blocking frame reads."""
+        callback_result = self.frame_callback(
+            stream_name,
+            frame,
+            frame_number,
+            timestamp,
+        )
+        if inspect.isawaitable(callback_result):
+            task = asyncio.create_task(callback_result)
+            self._track_callback_task(stream_name, task)
+
+    async def _wait_for_callback_slot(self, stream_name: str) -> bool:
+        """Reserve a processing slot or apply backpressure policy."""
+        pending_tasks = self.callback_tasks.setdefault(stream_name, set())
+        if len(pending_tasks) < self.config.max_pending_frames:
+            return True
+
+        if self.config.drop_frames_when_busy:
+            dropped = self.dropped_frames.get(stream_name, 0) + 1
+            self.dropped_frames[stream_name] = dropped
+            if dropped == 1 or dropped % 50 == 0:
+                logger.warning(
+                    f"Stream {stream_name} is saturated, dropped {dropped} frames"
+                )
+            return False
+
+        done, _ = await asyncio.wait(
+            pending_tasks,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in done:
+            pending_tasks.discard(task)
+        return True
+
     async def _process_stream(self, stream_name: str, stream_url: str) -> None:
         """Process a single RTSP stream with auto-reconnection.
 
@@ -217,16 +276,18 @@ class RTSPStreamProcessor:
                 self.frame_counters[stream_name] = frame_number
                 self.last_frame_time[stream_name] = timestamp
 
+                has_capacity = await self._wait_for_callback_slot(stream_name)
+                if not has_capacity:
+                    continue
+
                 # Call callback (this should be fast, non-blocking)
                 try:
-                    callback_result = self.frame_callback(
+                    await self._dispatch_frame_callback(
                         stream_name,
                         frame,
                         frame_number,
                         timestamp,
                     )
-                    if inspect.isawaitable(callback_result):
-                        await callback_result
                 except Exception as e:
                     logger.error(f"Error in frame callback for {stream_name}: {e}")
 
@@ -270,6 +331,8 @@ class RTSPStreamProcessor:
             self.frame_counters[stream_name] = 0
             self.reconnect_attempts[stream_name] = 0
             self.last_frame_time[stream_name] = datetime.now()
+            self.callback_tasks[stream_name] = set()
+            self.dropped_frames[stream_name] = 0
 
             # Create task for stream processing
             task = asyncio.create_task(
@@ -289,6 +352,14 @@ class RTSPStreamProcessor:
         if self.tasks:
             await asyncio.gather(*self.tasks.values(), return_exceptions=True)
 
+        callback_tasks = [
+            task
+            for stream_tasks in self.callback_tasks.values()
+            for task in stream_tasks
+        ]
+        if callback_tasks:
+            await asyncio.gather(*callback_tasks, return_exceptions=True)
+
     async def stop(self) -> None:
         """Stop processing all streams."""
         logger.info("Stopping all stream processors...")
@@ -304,6 +375,14 @@ class RTSPStreamProcessor:
         if self.tasks:
             await asyncio.gather(*self.tasks.values(), return_exceptions=True)
 
+        callback_tasks = [
+            task
+            for stream_tasks in self.callback_tasks.values()
+            for task in stream_tasks
+        ]
+        if callback_tasks:
+            await asyncio.gather(*callback_tasks, return_exceptions=True)
+
         # Release all captures
         for stream_name in list(self.cap_dict.keys()):
             self._cleanup_capture(stream_name)
@@ -311,6 +390,7 @@ class RTSPStreamProcessor:
         self.cap_dict.clear()
         self.tasks.clear()
         self.heartbeat_tasks.clear()
+        self.callback_tasks.clear()
         logger.info("All stream processors stopped")
 
     def get_stream_status(self) -> Dict[str, Dict[str, Any]]:
@@ -333,5 +413,7 @@ class RTSPStreamProcessor:
                     if stream_name in self.last_frame_time
                     else None
                 ),
+                "pending_frames": len(self.callback_tasks.get(stream_name, set())),
+                "dropped_frames": self.dropped_frames.get(stream_name, 0),
             }
         return status

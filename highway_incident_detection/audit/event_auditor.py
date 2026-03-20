@@ -11,7 +11,12 @@ from urllib import error, request
 import cv2
 
 from highway_incident_detection.config.settings import AuditConfig
-from highway_incident_detection.detectors.event_types import EventType, IncidentEvent
+from highway_incident_detection.detectors.event_types import (
+    EventType,
+    EventTypeLike,
+    IncidentEvent,
+    event_type_name,
+)
 from highway_incident_detection.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -164,7 +169,7 @@ class EventAuditor:
         return (
             "Review the detector result for a highway-monitoring system and decide "
             "whether the event is real. "
-            f"Event type: {event.event_type.value}. "
+            f"Event type: {event.event_type_value}. "
             f"Detector confidence: {event.confidence:.2f}. "
             f"Description: {event.description}. "
             f"Metadata: {json.dumps(event.metadata, ensure_ascii=False)}. "
@@ -320,8 +325,9 @@ class EventAuditor:
             recommended_action=recommended_action,
         )
 
-    def _recommended_action(self, event_type: EventType, risk_level: str) -> str:
+    def _recommended_action(self, event_type: EventTypeLike, risk_level: str) -> str:
         """Map event types and risk levels to operator actions."""
+        event_name = event_type_name(event_type)
         if risk_level in {"high", "critical"}:
-            return f"Escalate {event_type.value} to manual verification immediately"
-        return f"Keep monitoring {event_type.value} and retain generated evidence"
+            return f"Escalate {event_name} to manual verification immediately"
+        return f"Keep monitoring {event_name} and retain generated evidence"

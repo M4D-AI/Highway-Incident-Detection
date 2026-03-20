@@ -59,6 +59,10 @@ dev = [
     "mypy>=1.0.0",
     "types-PyYAML>=6.0.0",
 ]
+integrations = [
+    "kafka-python>=2.0.0",
+    "redis>=5.0.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/M4D-AI/highway-incident-detection"
@@ -74,7 +78,7 @@ highway-detection = "highway_incident_detection.cli:main"  # 简短别名
 "highway_incident_detection" = ["py.typed"]
 
 [tool.setuptools.packages.find]
-include = ["highway_incident_detection*"]
+include = ["highway_incident_detection*", "custom_detectors*"]
 
 [tool.black]
 line-length = 100

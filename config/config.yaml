@@ -29,6 +29,12 @@ event:
   congestion_speed_threshold: 2.0  # Max average speed (px/frame) to consider congestion
   congestion_detection_frames: 30  # Frames to confirm congestion
   congestion_density_threshold: 0.3  # Minimum vehicle density (0.0-1.0)
+  custom_detectors:
+    - name: "smoke_alert_rule"
+      event_type: "smoke_alert"
+      handler: "custom_detectors.smoke:smoke_alert_detector"
+      enabled: false
+      prepend: true
 
 stream:
   streams:
@@ -56,6 +62,8 @@ stream:
   heartbeat_interval: 30  # Heartbeat check interval in seconds
   no_frame_timeout: 60  # Timeout for no frames received (seconds)
   auto_reconnect: true  # Enable automatic reconnection
+  max_pending_frames: 2  # Max in-flight frame processing tasks per stream
+  drop_frames_when_busy: true  # Drop latest frames under sustained backpressure
 
 output:
   output_dir: "./output"
