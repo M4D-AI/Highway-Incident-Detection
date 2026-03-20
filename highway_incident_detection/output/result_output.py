@@ -17,6 +17,7 @@ class EventResult:
     summary_path: str
     audit_path: str = ""
     audit: Optional[Dict[str, Any]] = None
+    processing_metrics: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize the event result for downstream systems."""
@@ -35,6 +36,7 @@ class EventResult:
             "summary_path": self.summary_path,
             "audit_path": self.audit_path,
             "audit": self.audit,
+            "processing_metrics": self.processing_metrics,
         }
 
 

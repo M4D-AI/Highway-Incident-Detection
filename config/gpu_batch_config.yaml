@@ -1,0 +1,100 @@
+# GPU-oriented example configuration for multi-stream micro-batch inference.
+
+yolo:
+  model_path: "yolov8n.pt"
+  confidence_threshold: 0.5
+  iou_threshold: 0.45
+  device: "cuda"
+  img_size: 640
+  auto_restart: true
+  health_check_interval: 300
+  max_failures: 5
+  batch_inference_enabled: true
+  max_batch_size: 8
+  batch_timeout_ms: 10
+  batch_queue_size: 64
+
+event:
+  construction_vehicle_class_ids: [2, 3, 5, 7]
+  worker_class_id: 0
+  motorcycle_class_id: 3
+  pedestrian_class_id: 0
+  debris_class_ids: [24, 25, 26, 27, 28]
+  construction_detection_frames: 10
+  reverse_detection_frames: 15
+  reverse_speed_threshold: -0.5
+  event_cooldown_seconds: 30
+  parking_detection_frames: 60
+  parking_speed_threshold: 0.5
+  parking_position_threshold: 10.0
+  congestion_min_vehicles: 5
+  congestion_speed_threshold: 2.0
+  congestion_detection_frames: 30
+  congestion_density_threshold: 0.3
+  custom_detectors:
+    - name: "smoke_alert_rule"
+      event_type: "smoke_alert"
+      handler: "custom_detectors.smoke:smoke_alert_detector"
+      enabled: false
+      prepend: true
+
+stream:
+  streams:
+    - name: "stream_1"
+      url: "data/parking.mp4"
+      enabled: true
+      lane:
+        enabled: false
+        roi_points: []
+        direction: null
+    - name: "stream_2"
+      url: "data/trash.mp4"
+      enabled: true
+  frame_skip: 1
+  buffer_size: 30
+  reconnect_interval: 5
+  max_reconnect_attempts: -1
+  read_timeout: 10
+  heartbeat_interval: 30
+  no_frame_timeout: 60
+  auto_reconnect: true
+  max_pending_frames: 4
+  drop_frames_when_busy: true
+
+output:
+  output_dir: "./output"
+  keyframe_dir: "./output/keyframes"
+  video_dir: "./output/videos"
+  summary_dir: "./output/summaries"
+  audit_dir: "./output/audits"
+  video_duration_seconds: 10
+  video_fps: 25
+
+audit:
+  enabled: false
+  provider: "openai_compatible"
+  endpoint: null
+  api_key: null
+  model_name: "gpt-4.1-mini"
+  system_prompt: "You are reviewing highway incident detections. Return strict JSON with keys: confirmed, risk_level, confidence, reason, recommended_action."
+  user_prompt_template: "Review the detector result for a highway-monitoring system and decide whether the event is real. Event type: {event_type}. Detector confidence: {confidence:.2f}. Description: {description}. Stream name: {stream_name}. Frame number: {frame_number}. Timestamp: {timestamp}. Metadata: {metadata_json}. Classify risk_level as one of: {risk_levels}. If the evidence is weak, set confirmed to false."
+  system_prompt_path: null
+  user_prompt_path: null
+  event_prompt_overrides: {}
+  timeout_seconds: 20
+  max_images: 3
+  sample_video_frames: true
+  min_event_confidence: 0.35
+  save_raw_response: false
+
+logging:
+  log_dir: "./logs"
+  log_level: "INFO"
+  log_rotation: "100 MB"
+  log_retention: "30 days"
+  log_format: "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} | {message}"
+
+lane:
+  enabled: false
+  roi_points: []
+  direction: null

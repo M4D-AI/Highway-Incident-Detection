@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 from dataclasses import dataclass
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib import error, request
@@ -23,6 +24,24 @@ logger = get_logger(__name__)
 
 
 DEFAULT_RISK_LEVELS = ("low", "medium", "high", "critical")
+DEFAULT_SYSTEM_PROMPT = (
+    "You are reviewing highway incident detections. "
+    "Return strict JSON with keys: confirmed, risk_level, confidence, "
+    "reason, recommended_action."
+)
+DEFAULT_USER_PROMPT_TEMPLATE = (
+    "Review the detector result for a highway-monitoring system and decide "
+    "whether the event is real. "
+    "Event type: {event_type}. "
+    "Detector confidence: {confidence:.2f}. "
+    "Description: {description}. "
+    "Stream name: {stream_name}. "
+    "Frame number: {frame_number}. "
+    "Timestamp: {timestamp}. "
+    "Metadata: {metadata_json}. "
+    "Classify risk_level as one of: {risk_levels}. "
+    "If the evidence is weak, set confirmed to false."
+)
 FALLBACK_RISK_BY_EVENT = {
     EventType.CONSTRUCTION: "medium",
     EventType.REVERSE_VEHICLE: "high",
@@ -122,32 +141,7 @@ class EventAuditor:
         video_path: str,
     ) -> Dict[str, Any]:
         """Call an OpenAI-compatible multimodal chat completion endpoint."""
-        images = self._collect_images(keyframe_path, video_path)
-        prompt = self._build_prompt(event)
-        content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
-        for image in images:
-            content.append(
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{image}"},
-                }
-            )
-
-        payload = {
-            "model": self.config.model_name,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are reviewing highway incident detections. "
-                        "Return strict JSON with keys: confirmed, risk_level, "
-                        "confidence, reason, recommended_action."
-                    ),
-                },
-                {"role": "user", "content": content},
-            ],
-            "temperature": 0.1,
-        }
+        payload = self._build_openai_payload(event, keyframe_path, video_path)
         req = request.Request(
             self.config.endpoint,
             data=json.dumps(payload).encode("utf-8"),
@@ -164,18 +158,118 @@ class EventAuditor:
             body = exc.read().decode("utf-8", errors="ignore")
             raise RuntimeError(f"HTTP {exc.code}: {body}") from exc
 
-    def _build_prompt(self, event: IncidentEvent) -> str:
-        """Build the audit instruction prompt."""
-        return (
-            "Review the detector result for a highway-monitoring system and decide "
-            "whether the event is real. "
-            f"Event type: {event.event_type_value}. "
-            f"Detector confidence: {event.confidence:.2f}. "
-            f"Description: {event.description}. "
-            f"Metadata: {json.dumps(event.metadata, ensure_ascii=False)}. "
-            "Classify risk_level as one of: low, medium, high, critical. "
-            "If the evidence is weak, set confirmed to false."
+    def _build_openai_payload(
+        self,
+        event: IncidentEvent,
+        keyframe_path: str,
+        video_path: str,
+    ) -> Dict[str, Any]:
+        """Build the OpenAI-compatible request payload."""
+        images = self._collect_images(keyframe_path, video_path)
+        system_prompt, prompt = self._resolve_prompts(event)
+        content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
+        for image in images:
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{image}"},
+                }
+            )
+
+        payload = {
+            "model": self.config.model_name,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": system_prompt,
+                },
+                {"role": "user", "content": content},
+            ],
+            "temperature": 0.1,
+        }
+        return payload
+
+    def _resolve_prompts(self, event: IncidentEvent) -> tuple[str, str]:
+        """Resolve system and user prompts for one event."""
+        event_override = self._get_event_prompt_override(event.event_type_value)
+        system_prompt = self._load_prompt_text(
+            prompt_path=getattr(event_override, "system_prompt_path", None),
+            prompt_text=getattr(event_override, "system_prompt", None),
+            fallback_path=self.config.system_prompt_path,
+            fallback_text=self.config.system_prompt,
+            default_text=DEFAULT_SYSTEM_PROMPT,
         )
+        user_prompt = self._build_prompt(event, event_override=event_override)
+        return system_prompt, user_prompt
+
+    def _build_prompt(
+        self,
+        event: IncidentEvent,
+        *,
+        event_override: Optional[Any] = None,
+    ) -> str:
+        """Build the audit instruction prompt."""
+        template = self._load_prompt_text(
+            prompt_path=getattr(event_override, "user_prompt_path", None),
+            prompt_text=getattr(event_override, "user_prompt_template", None),
+            fallback_path=self.config.user_prompt_path,
+            fallback_text=self.config.user_prompt_template,
+            default_text=DEFAULT_USER_PROMPT_TEMPLATE,
+        )
+        context = self._prompt_context(event)
+        try:
+            return template.format_map(defaultdict(str, context))
+        except Exception as exc:
+            logger.warning(f"Failed to render custom audit user prompt, using default: {exc}")
+            return DEFAULT_USER_PROMPT_TEMPLATE.format_map(defaultdict(str, context))
+
+    def _get_event_prompt_override(self, event_type: str) -> Optional[Any]:
+        """Return prompt override config for one event type if configured."""
+        return self.config.event_prompt_overrides.get(event_type)
+
+    def _load_prompt_text(
+        self,
+        *,
+        prompt_path: Optional[str],
+        prompt_text: Optional[str],
+        fallback_path: Optional[str],
+        fallback_text: Optional[str],
+        default_text: str,
+    ) -> str:
+        """Load a prompt from file or inline config."""
+        if prompt_path:
+            try:
+                text = Path(prompt_path).read_text(encoding="utf-8").strip()
+                if text:
+                    return text
+            except Exception as exc:
+                logger.warning(f"Failed to read audit prompt file {prompt_path}: {exc}")
+        if prompt_text:
+            return prompt_text.strip() or default_text
+        if fallback_path:
+            try:
+                text = Path(fallback_path).read_text(encoding="utf-8").strip()
+                if text:
+                    return text
+            except Exception as exc:
+                logger.warning(f"Failed to read audit prompt file {fallback_path}: {exc}")
+        return (fallback_text or default_text).strip() or default_text
+
+    def _prompt_context(self, event: IncidentEvent) -> Dict[str, Any]:
+        """Build template context for custom prompts."""
+        metadata = event.metadata or {}
+        return {
+            "event_type": event.event_type_value,
+            "confidence": event.confidence,
+            "description": event.description,
+            "stream_name": event.stream_name,
+            "frame_number": event.frame_number,
+            "timestamp": event.timestamp.isoformat(),
+            "bbox": list(event.bbox) if event.bbox else None,
+            "metadata": metadata,
+            "metadata_json": json.dumps(metadata, ensure_ascii=False),
+            "risk_levels": ", ".join(DEFAULT_RISK_LEVELS),
+        }
 
     def _collect_images(self, keyframe_path: str, video_path: str) -> List[str]:
         """Collect keyframe and sampled video frames as base64 JPEG strings."""

@@ -37,6 +37,7 @@ def test_result_handler_is_called_after_result_emission(tmp_path):
         summary_path="a.json",
         audit_path="a.audit.json",
         audit={"confirmed": True, "risk_level": "medium"},
+        processing_metrics={"mode": "micro_batch", "batch_size": 4},
     )
 
     asyncio.run(generator._emit_result(result))
@@ -44,6 +45,7 @@ def test_result_handler_is_called_after_result_emission(tmp_path):
     assert len(received) == 1
     assert received[0]["event_id"] == "evt-1"
     assert received[0]["summary_path"] == "a.json"
+    assert received[0]["processing_metrics"]["batch_size"] == 4
 
 
 def test_result_handlers_support_sync_and_async(tmp_path):

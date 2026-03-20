@@ -48,6 +48,27 @@ class YOLOConfig(BaseSettings):
         ge=1,
         description="Maximum consecutive failures before restart"
     )
+    batch_inference_enabled: bool = Field(
+        default=False,
+        description="Enable micro-batch inference across multiple streams"
+    )
+    max_batch_size: int = Field(
+        default=4,
+        ge=1,
+        le=64,
+        description="Maximum number of frames in one inference batch"
+    )
+    batch_timeout_ms: int = Field(
+        default=15,
+        ge=1,
+        le=1000,
+        description="Maximum wait time in milliseconds to form an inference batch"
+    )
+    batch_queue_size: int = Field(
+        default=32,
+        ge=1,
+        description="Maximum queued frames waiting for batch inference"
+    )
 
     model_config = SettingsConfigDict(extra="forbid")
 
@@ -291,6 +312,28 @@ class OutputConfig(BaseSettings):
 
     model_config = SettingsConfigDict(extra="forbid")
 
+class AuditPromptOverrideConfig(BaseSettings):
+    """Per-event audit prompt override configuration."""
+
+    system_prompt: Optional[str] = Field(
+        default=None,
+        description="Optional system prompt override for a specific event type"
+    )
+    user_prompt_template: Optional[str] = Field(
+        default=None,
+        description="Optional user prompt template override for a specific event type"
+    )
+    system_prompt_path: Optional[str] = Field(
+        default=None,
+        description="Optional system prompt file override for a specific event type"
+    )
+    user_prompt_path: Optional[str] = Field(
+        default=None,
+        description="Optional user prompt file override for a specific event type"
+    )
+
+    model_config = SettingsConfigDict(extra="forbid")
+
 
 class AuditConfig(BaseSettings):
     """Large-model audit configuration."""
@@ -314,6 +357,42 @@ class AuditConfig(BaseSettings):
     model_name: str = Field(
         default="gpt-4.1-mini",
         description="Model name used for event audit"
+    )
+    system_prompt: str = Field(
+        default=(
+            "You are reviewing highway incident detections. "
+            "Return strict JSON with keys: confirmed, risk_level, confidence, "
+            "reason, recommended_action."
+        ),
+        description="System prompt sent to the audit model"
+    )
+    user_prompt_template: str = Field(
+        default=(
+            "Review the detector result for a highway-monitoring system and decide "
+            "whether the event is real. "
+            "Event type: {event_type}. "
+            "Detector confidence: {confidence:.2f}. "
+            "Description: {description}. "
+            "Stream name: {stream_name}. "
+            "Frame number: {frame_number}. "
+            "Timestamp: {timestamp}. "
+            "Metadata: {metadata_json}. "
+            "Classify risk_level as one of: {risk_levels}. "
+            "If the evidence is weak, set confirmed to false."
+        ),
+        description="User prompt template sent to the audit model"
+    )
+    system_prompt_path: Optional[str] = Field(
+        default=None,
+        description="Optional file path for the system prompt template"
+    )
+    user_prompt_path: Optional[str] = Field(
+        default=None,
+        description="Optional file path for the user prompt template"
+    )
+    event_prompt_overrides: Dict[str, AuditPromptOverrideConfig] = Field(
+        default_factory=dict,
+        description="Per-event prompt overrides keyed by event type string"
     )
     timeout_seconds: int = Field(
         default=20,

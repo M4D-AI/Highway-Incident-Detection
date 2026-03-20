@@ -9,6 +9,10 @@ yolo:
   auto_restart: true  # Enable automatic model restart on failure
   health_check_interval: 300  # Health check interval in seconds
   max_failures: 5  # Maximum consecutive failures before restart
+  batch_inference_enabled: false  # Recommended to enable on GPU for multi-stream micro-batching
+  max_batch_size: 4
+  batch_timeout_ms: 15
+  batch_queue_size: 32
 
 event:
   construction_vehicle_class_ids: [2, 3, 5, 7]  # car, motorcycle, bus, truck
@@ -80,6 +84,15 @@ audit:
   endpoint: null  # Example: "https://api.openai.com/v1/chat/completions"
   api_key: null  # Recommended: inject from environment instead of plain text
   model_name: "gpt-4.1-mini"
+  system_prompt: "You are reviewing highway incident detections. Return strict JSON with keys: confirmed, risk_level, confidence, reason, recommended_action."
+  user_prompt_template: "Review the detector result for a highway-monitoring system and decide whether the event is real. Event type: {event_type}. Detector confidence: {confidence:.2f}. Description: {description}. Stream name: {stream_name}. Frame number: {frame_number}. Timestamp: {timestamp}. Metadata: {metadata_json}. Classify risk_level as one of: {risk_levels}. If the evidence is weak, set confirmed to false."
+  system_prompt_path: null  # Optional text file path, overrides system_prompt when set
+  user_prompt_path: null  # Optional text file path, overrides user_prompt_template when set
+  event_prompt_overrides: {}
+  # event_prompt_overrides:
+  #   pedestrian:
+  #     system_prompt: "You only review pedestrian intrusion events and must be conservative."
+  #     user_prompt_template: "Please verify pedestrian intrusion. Stream={stream_name}, frame={frame_number}, evidence={metadata_json}"
   timeout_seconds: 20
   max_images: 3
   sample_video_frames: true

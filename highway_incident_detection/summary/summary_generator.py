@@ -217,6 +217,7 @@ class SummaryGenerator:
         keyframe_path: str,
         video_path: str,
         audit_result: Optional[Dict[str, Any]] = None,
+        processing_metrics: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Generate summary JSON file for event.
 
@@ -243,6 +244,7 @@ class SummaryGenerator:
                 "keyframe_path": keyframe_path,
                 "video_path": video_path,
                 "audit": audit_result,
+                "processing_metrics": processing_metrics,
             }
 
             # Create filename
@@ -351,6 +353,9 @@ class SummaryGenerator:
             )
             audit_summary: Optional[Dict[str, Any]] = None
             audit_path = ""
+            processing_metrics = None
+            if event.metadata:
+                processing_metrics = event.metadata.get("processing_metrics")
             if self.auditor and self.auditor.enabled:
                 audit = await self.auditor.audit_event(event, keyframe_path, video_path)
                 audit_summary = audit.to_dict(
@@ -364,6 +369,7 @@ class SummaryGenerator:
                 keyframe_path,
                 video_path,
                 audit_summary,
+                processing_metrics,
             )
             await self._emit_result(
                 EventResult(
@@ -374,6 +380,7 @@ class SummaryGenerator:
                     summary_path=summary_path,
                     audit_path=audit_path,
                     audit=audit_summary,
+                    processing_metrics=processing_metrics,
                 )
             )
 

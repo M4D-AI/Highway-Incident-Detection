@@ -50,15 +50,25 @@ highway-incident-detection --config config/config.yaml
 python main.py --config config/config.yaml
 ```
 
+GPU 多流场景建议直接从 [config/gpu_batch_config.yaml](/Users/xiezhanlong/PycharmProjects/HighwayIncidentDetection/config/gpu_batch_config.yaml) 起步：
+
+```bash
+highway-incident-detection --config config/gpu_batch_config.yaml
+```
+
 ## 最常用配置
 
 默认配置在 [config/config.yaml](/Users/xiezhanlong/PycharmProjects/HighwayIncidentDetection/config/config.yaml)。
+GPU 微批示例在 [config/gpu_batch_config.yaml](/Users/xiezhanlong/PycharmProjects/HighwayIncidentDetection/config/gpu_batch_config.yaml)。
 
 ```yaml
 yolo:
   model_path: "yolov8n.pt"
   confidence_threshold: 0.5
   device: "cpu"
+  batch_inference_enabled: true
+  max_batch_size: 4
+  batch_timeout_ms: 15
 
 stream:
   frame_skip: 1
@@ -68,6 +78,7 @@ stream:
 audit:
   enabled: false
   model_name: "gpt-4.1-mini"
+  user_prompt_path: "./prompts/audit_user.txt"
 ```
 
 ## 输出结果
@@ -80,6 +91,60 @@ audit:
 - `output/audits/`
 
 同时支持对外推送统一结果对象 `EventResult`。
+`summary JSON` 和 `EventResult` 会带 `processing_metrics`，可直接拿到批大小、排队等待和后处理等待。
+
+## 审计 Prompt 自定义
+
+审计模块支持直接改 prompt，不需要改代码。可选两种方式：
+
+- 在配置里直接写 `audit.system_prompt` 和 `audit.user_prompt_template`
+- 用 `audit.system_prompt_path` 和 `audit.user_prompt_path` 指向外部文本文件
+- 用 `audit.event_prompt_overrides.<event_type>` 为某个事件单独覆盖 prompt，未命中时仍走全局默认
+
+`user_prompt_template` 支持这些占位符：
+
+- `{event_type}`
+- `{confidence}`
+- `{description}`
+- `{stream_name}`
+- `{frame_number}`
+- `{timestamp}`
+- `{metadata_json}`
+- `{risk_levels}`
+
+示例：
+
+```yaml
+audit:
+  enabled: true
+  endpoint: "https://api.openai.com/v1/chat/completions"
+  api_key: "${OPENAI_API_KEY}"
+  system_prompt: "你是高速事件复核员，只返回 JSON。"
+  user_prompt_template: |
+    请复核以下事件是否真实：
+    事件类型: {event_type}
+    置信度: {confidence:.2f}
+    流名称: {stream_name}
+    帧号: {frame_number}
+    描述: {description}
+    元数据: {metadata_json}
+```
+
+按事件类型覆盖的示例：
+
+```yaml
+audit:
+  system_prompt: "你是高速事件复核员，只返回 JSON。"
+  user_prompt_template: "请复核事件 {event_type}。"
+  event_prompt_overrides:
+    pedestrian:
+      system_prompt: "你专门复核行人闯入事件，只返回 JSON。"
+      user_prompt_template: |
+        请重点判断是否真有行人进入车道：
+        流名称: {stream_name}
+        帧号: {frame_number}
+        描述: {description}
+```
 
 ## 结果接口
 
@@ -90,11 +155,19 @@ from highway_incident_detection import EventResult, HighwayIncidentDetectionSyst
 
 
 async def handle_result(result: EventResult) -> None:
-    print(result.to_dict())
+    payload = result.to_dict()
+    print(payload["event_type"], payload["processing_metrics"])
 
 
 system = HighwayIncidentDetectionSystem(config_path="config/config.yaml")
 system.register_result_handler(handle_result)
+```
+
+运行中也可以直接读系统快照：
+
+```python
+stats = system.get_runtime_stats()
+print(stats["batch_inference"]["avg_batch_size"])
 ```
 
 ### 内置 handler
@@ -175,6 +248,21 @@ python benchmarks/pipeline_benchmark.py \
   --handler-delay-ms 10 \
   --emit-every-n-frames 30
 ```
+
+如果是 GPU 多流场景，建议重点调这几个参数：
+
+- `yolo.batch_inference_enabled`
+- `yolo.max_batch_size`
+- `yolo.batch_timeout_ms`
+- `yolo.batch_queue_size`
+- `stream.max_pending_frames`
+
+重点观察这些运行时指标：
+
+- `avg_batch_size`
+- `timeout_batches`
+- `avg_queue_wait_ms`
+- `avg_postprocess_wait_ms`
 
 ## 文档
 

@@ -2,8 +2,9 @@
 
 import asyncio
 import threading
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -26,6 +27,31 @@ from highway_incident_detection.utils.logger import get_logger, setup_logger
 from highway_incident_detection.utils.resource_monitor import ResourceMonitor
 from highway_incident_detection.utils.roi_filter import filter_detections_by_roi
 from highway_incident_detection.utils.tracker import ObjectTracker
+
+
+@dataclass
+class FrameEnvelope:
+    """Frame data exchanged between stream readers and inference workers."""
+
+    stream_name: str
+    frame: np.ndarray
+    frame_number: int
+    timestamp: datetime
+    enqueued_at_monotonic: float = 0.0
+    queue_depth_at_enqueue: int = 0
+
+
+@dataclass
+class FrameInferenceResult:
+    """Inference result for one frame after micro-batch detection."""
+
+    envelope: FrameEnvelope
+    detections: List[Tuple[int, float, Tuple[float, float, float, float]]]
+    batch_size: int
+    batch_timed_out: bool
+    queue_wait_ms: float
+    inference_duration_ms: float
+    ready_at_monotonic: float
 
 
 class HighwayIncidentDetectionSystem:
@@ -66,8 +92,15 @@ class HighwayIncidentDetectionSystem:
             for stream_config in self.settings.stream.streams
             if stream_config.get("name")
         }
+        self._pending_inference_results: Dict[str, Dict[int, FrameInferenceResult]] = {}
+        self._next_frame_to_process: Dict[str, int] = {}
+        self._batch_metrics_lock = threading.Lock()
+        self._batch_metrics = self._empty_batch_metrics_state()
 
         self.event_queue: asyncio.Queue = asyncio.Queue()
+        self.inference_queue: asyncio.Queue = asyncio.Queue(
+            maxsize=self.settings.yolo.batch_queue_size
+        )
         self.stream_processor = RTSPStreamProcessor(
             self.settings.stream,
             frame_callback=self._process_frame,
@@ -81,6 +114,192 @@ class HighwayIncidentDetectionSystem:
         self.running = False
         self._monitoring_task: Optional[asyncio.Task] = None
         self._shutdown_event: Optional[asyncio.Event] = None
+        self._inference_task: Optional[asyncio.Task] = None
+
+    @staticmethod
+    def _empty_batch_metrics_state() -> Dict[str, Any]:
+        """Create the mutable batch metrics state container."""
+        return {
+            "total_enqueued_frames": 0,
+            "total_completed_frames": 0,
+            "total_batches": 0,
+            "total_frames_in_batches": 0,
+            "timeout_batches": 0,
+            "full_batches": 0,
+            "max_batch_size_seen": 0,
+            "max_queue_depth_seen": 0,
+            "total_queue_wait_ms": 0.0,
+            "total_inference_duration_ms": 0.0,
+            "total_postprocess_wait_ms": 0.0,
+            "per_stream": {},
+        }
+
+    @staticmethod
+    def _empty_stream_batch_metrics() -> Dict[str, Any]:
+        """Create the mutable per-stream metrics state container."""
+        return {
+            "enqueued_frames": 0,
+            "completed_frames": 0,
+            "last_frame_number": 0,
+            "last_queue_wait_ms": 0.0,
+            "last_postprocess_wait_ms": 0.0,
+            "total_queue_wait_ms": 0.0,
+            "total_postprocess_wait_ms": 0.0,
+        }
+
+    def _record_batch_enqueue(self, stream_name: str, queue_depth: int) -> None:
+        """Record queueing metrics for one frame."""
+        with self._batch_metrics_lock:
+            metrics = self._batch_metrics
+            metrics["total_enqueued_frames"] += 1
+            metrics["max_queue_depth_seen"] = max(metrics["max_queue_depth_seen"], queue_depth)
+            stream_metrics = metrics["per_stream"].setdefault(
+                stream_name,
+                self._empty_stream_batch_metrics(),
+            )
+            stream_metrics["enqueued_frames"] += 1
+
+    def _record_batch_completion(
+        self,
+        batch: List[FrameEnvelope],
+        *,
+        batch_timed_out: bool,
+        inference_duration_ms: float,
+        queue_waits_ms: List[float],
+    ) -> None:
+        """Record one completed inference batch."""
+        with self._batch_metrics_lock:
+            metrics = self._batch_metrics
+            batch_size = len(batch)
+            metrics["total_batches"] += 1
+            metrics["total_frames_in_batches"] += batch_size
+            metrics["total_completed_frames"] += batch_size
+            metrics["max_batch_size_seen"] = max(metrics["max_batch_size_seen"], batch_size)
+            metrics["total_inference_duration_ms"] += inference_duration_ms
+            if batch_timed_out:
+                metrics["timeout_batches"] += 1
+            if batch_size >= self.settings.yolo.max_batch_size:
+                metrics["full_batches"] += 1
+
+            for envelope, queue_wait_ms in zip(batch, queue_waits_ms):
+                metrics["total_queue_wait_ms"] += queue_wait_ms
+                stream_metrics = metrics["per_stream"].setdefault(
+                    envelope.stream_name,
+                    self._empty_stream_batch_metrics(),
+                )
+                stream_metrics["completed_frames"] += 1
+                stream_metrics["last_frame_number"] = envelope.frame_number
+                stream_metrics["last_queue_wait_ms"] = queue_wait_ms
+                stream_metrics["total_queue_wait_ms"] += queue_wait_ms
+
+    def _record_postprocess_wait(
+        self,
+        stream_name: str,
+        frame_number: int,
+        postprocess_wait_ms: float,
+    ) -> None:
+        """Record post-inference waiting time before ordered tracker/event processing."""
+        with self._batch_metrics_lock:
+            metrics = self._batch_metrics
+            metrics["total_postprocess_wait_ms"] += postprocess_wait_ms
+            stream_metrics = metrics["per_stream"].setdefault(
+                stream_name,
+                self._empty_stream_batch_metrics(),
+            )
+            stream_metrics["last_frame_number"] = frame_number
+            stream_metrics["last_postprocess_wait_ms"] = postprocess_wait_ms
+            stream_metrics["total_postprocess_wait_ms"] += postprocess_wait_ms
+
+    def _attach_processing_metrics(
+        self,
+        events: List[IncidentEvent],
+        inference_result: FrameInferenceResult,
+        *,
+        postprocess_wait_ms: float,
+    ) -> None:
+        """Attach micro-batch processing metrics to emitted events."""
+        processing_metrics = {
+            "mode": "micro_batch",
+            "batch_size": inference_result.batch_size,
+            "batch_timed_out": inference_result.batch_timed_out,
+            "queue_wait_ms": round(inference_result.queue_wait_ms, 3),
+            "postprocess_wait_ms": round(postprocess_wait_ms, 3),
+            "inference_duration_ms": round(inference_result.inference_duration_ms, 3),
+            "queue_depth_at_enqueue": inference_result.envelope.queue_depth_at_enqueue,
+        }
+        for event in events:
+            event.metadata = dict(event.metadata or {})
+            event.metadata["processing_metrics"] = processing_metrics.copy()
+
+    def get_batch_inference_stats(self) -> Dict[str, Any]:
+        """Return a snapshot of micro-batch runtime metrics."""
+        with self._batch_metrics_lock:
+            metrics = self._batch_metrics
+            total_frames = metrics["total_completed_frames"]
+            total_batches = metrics["total_batches"]
+            per_stream = {}
+            for stream_name, stream_metrics in metrics["per_stream"].items():
+                completed_frames = stream_metrics["completed_frames"]
+                per_stream[stream_name] = {
+                    "enqueued_frames": stream_metrics["enqueued_frames"],
+                    "completed_frames": completed_frames,
+                    "last_frame_number": stream_metrics["last_frame_number"],
+                    "last_queue_wait_ms": round(stream_metrics["last_queue_wait_ms"], 3),
+                    "last_postprocess_wait_ms": round(
+                        stream_metrics["last_postprocess_wait_ms"], 3
+                    ),
+                    "avg_queue_wait_ms": round(
+                        stream_metrics["total_queue_wait_ms"] / completed_frames, 3
+                    )
+                    if completed_frames
+                    else 0.0,
+                    "avg_postprocess_wait_ms": round(
+                        stream_metrics["total_postprocess_wait_ms"] / completed_frames, 3
+                    )
+                    if completed_frames
+                    else 0.0,
+                }
+
+            return {
+                "enabled": self.settings.yolo.batch_inference_enabled,
+                "queue_size": self.inference_queue.qsize(),
+                "queue_capacity": self.settings.yolo.batch_queue_size,
+                "total_enqueued_frames": metrics["total_enqueued_frames"],
+                "total_completed_frames": total_frames,
+                "total_batches": total_batches,
+                "timeout_batches": metrics["timeout_batches"],
+                "full_batches": metrics["full_batches"],
+                "timeout_rate": round(metrics["timeout_batches"] / total_batches, 4)
+                if total_batches
+                else 0.0,
+                "avg_batch_size": round(metrics["total_frames_in_batches"] / total_batches, 3)
+                if total_batches
+                else 0.0,
+                "max_batch_size_seen": metrics["max_batch_size_seen"],
+                "max_queue_depth_seen": metrics["max_queue_depth_seen"],
+                "avg_queue_wait_ms": round(metrics["total_queue_wait_ms"] / total_frames, 3)
+                if total_frames
+                else 0.0,
+                "avg_postprocess_wait_ms": round(
+                    metrics["total_postprocess_wait_ms"] / total_frames, 3
+                )
+                if total_frames
+                else 0.0,
+                "avg_inference_duration_ms": round(
+                    metrics["total_inference_duration_ms"] / total_batches, 3
+                )
+                if total_batches
+                else 0.0,
+                "per_stream": per_stream,
+            }
+
+    def get_runtime_stats(self) -> Dict[str, Any]:
+        """Return a consolidated runtime snapshot for external inspection."""
+        return {
+            "model": self.yolo_model.get_stats(),
+            "streams": self.stream_processor.get_stream_status(),
+            "batch_inference": self.get_batch_inference_stats(),
+        }
 
     def _load_configured_event_detectors(self) -> None:
         """Load custom detectors declared in configuration."""
@@ -124,44 +343,243 @@ class HighwayIncidentDetectionSystem:
         with stream_lock:
             with self._inference_lock:
                 detections = self.yolo_model.predict(frame, verbose=False)
-
-            lane_config = self.lane_configs.get(stream_name, {})
-            if lane_config.get("enabled", False):
-                roi_points = lane_config.get("roi_points", [])
-                if roi_points:
-                    detections = filter_detections_by_roi(detections, roi_points)
-
-            if stream_name not in self.trackers:
-                self.trackers[stream_name] = ObjectTracker(
-                    max_disappeared=5,
-                    max_distance=50.0,
-                )
-
-            tracker_detections = [(class_id, bbox) for class_id, _, bbox in detections]
-            tracked_objects = self.trackers[stream_name].update(
-                tracker_detections,
-                frame_number,
+            return self._finalize_frame_locked(
+                stream_name=stream_name,
+                frame=frame,
+                frame_number=frame_number,
+                timestamp=timestamp,
+                detections=detections,
             )
 
-            with self._event_detector_lock:
-                events = self.event_detector.process_frame(
-                    detections=detections,
-                    tracked_objects=tracked_objects,
-                    stream_name=stream_name,
-                    frame_number=frame_number,
-                    timestamp=timestamp,
-                    frame_width=frame.shape[1] if frame is not None else None,
-                    frame_height=frame.shape[0] if frame is not None else None,
-                )
+    def _finalize_frame_locked(
+        self,
+        stream_name: str,
+        frame: np.ndarray,
+        frame_number: int,
+        timestamp: datetime,
+        detections: List[Tuple[int, float, Tuple[float, float, float, float]]],
+    ) -> List[IncidentEvent]:
+        """Run post-inference per-stream processing in frame order."""
+        lane_config = self.lane_configs.get(stream_name, {})
+        if lane_config.get("enabled", False):
+            roi_points = lane_config.get("roi_points", [])
+            if roi_points:
+                detections = filter_detections_by_roi(detections, roi_points)
 
-            self.summary_generator.add_frame(stream_name, frame, frame_number, timestamp)
+        if stream_name not in self.trackers:
+            self.trackers[stream_name] = ObjectTracker(
+                max_disappeared=5,
+                max_distance=50.0,
+            )
+
+        tracker_detections = [(class_id, bbox) for class_id, _, bbox in detections]
+        tracked_objects = self.trackers[stream_name].update(
+            tracker_detections,
+            frame_number,
+        )
+
+        with self._event_detector_lock:
+            events = self.event_detector.process_frame(
+                detections=detections,
+                tracked_objects=tracked_objects,
+                stream_name=stream_name,
+                frame_number=frame_number,
+                timestamp=timestamp,
+                frame_width=frame.shape[1] if frame is not None else None,
+                frame_height=frame.shape[0] if frame is not None else None,
+            )
+
+        self.summary_generator.add_frame(stream_name, frame, frame_number, timestamp)
         return events
+
+    async def _process_detected_events(self, events: List[IncidentEvent]) -> None:
+        """Forward detected events to the async event queue."""
+        for event in events:
+            self.logger.info(
+                f"Event detected: {event.event_type_value} "
+                f"on {event.stream_name} at frame {event.frame_number} "
+                f"(confidence: {event.confidence:.2f})"
+            )
+            await self.event_queue.put(event)
+
+    async def _enqueue_frame_for_batch_inference(
+        self,
+        stream_name: str,
+        frame: np.ndarray,
+        frame_number: int,
+        timestamp: datetime,
+    ) -> None:
+        """Queue one frame for micro-batch inference."""
+        loop = asyncio.get_running_loop()
+        await self.inference_queue.put(
+            FrameEnvelope(
+                stream_name=stream_name,
+                frame=frame,
+                frame_number=frame_number,
+                timestamp=timestamp,
+                enqueued_at_monotonic=loop.time(),
+                queue_depth_at_enqueue=self.inference_queue.qsize(),
+            )
+        )
+        self._record_batch_enqueue(stream_name, self.inference_queue.qsize())
+
+    async def _collect_inference_batch(self) -> Tuple[List[FrameEnvelope], bool]:
+        """Collect a micro-batch of frames for one inference call."""
+        batch: List[FrameEnvelope] = []
+        batch_timed_out = False
+        first_item = await asyncio.wait_for(self.inference_queue.get(), timeout=1.0)
+        batch.append(first_item)
+
+        deadline = asyncio.get_running_loop().time() + (
+            self.settings.yolo.batch_timeout_ms / 1000.0
+        )
+        while len(batch) < self.settings.yolo.max_batch_size:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                batch_timed_out = True
+                break
+            try:
+                next_item = await asyncio.wait_for(self.inference_queue.get(), timeout=remaining)
+                batch.append(next_item)
+            except asyncio.TimeoutError:
+                batch_timed_out = True
+                break
+        return batch, batch_timed_out
+
+    async def _run_inference_batch(
+        self,
+        batch: List[FrameEnvelope],
+    ) -> List[List[Tuple[int, float, Tuple[float, float, float, float]]]]:
+        """Run one inference batch using the shared YOLO model."""
+        if not batch:
+            return []
+
+        images = [item.frame for item in batch]
+        with self._inference_lock:
+            if len(images) == 1:
+                return [self.yolo_model.predict(images[0], verbose=False)]
+            return self.yolo_model.predict_batch(images, verbose=False)
+
+    async def _drain_ready_stream_results(self, stream_name: str) -> None:
+        """Process ready inference results for one stream in strict frame order."""
+        stream_lock = self._stream_locks.setdefault(stream_name, threading.Lock())
+        pending_results = self._pending_inference_results.setdefault(stream_name, {})
+        next_frame = self._next_frame_to_process.setdefault(stream_name, 1)
+        loop = asyncio.get_running_loop()
+
+        while next_frame in pending_results:
+            inference_result = pending_results.pop(next_frame)
+            postprocess_wait_ms = max(
+                0.0,
+                (loop.time() - inference_result.ready_at_monotonic) * 1000.0,
+            )
+            self._record_postprocess_wait(
+                inference_result.envelope.stream_name,
+                inference_result.envelope.frame_number,
+                postprocess_wait_ms,
+            )
+            events = await asyncio.to_thread(
+                self._finalize_inference_result,
+                stream_lock,
+                inference_result.envelope,
+                inference_result.detections,
+            )
+            self._attach_processing_metrics(
+                events,
+                inference_result,
+                postprocess_wait_ms=postprocess_wait_ms,
+            )
+            await self._process_detected_events(events)
+            next_frame += 1
+
+        self._next_frame_to_process[stream_name] = next_frame
+
+    def _finalize_inference_result(
+        self,
+        stream_lock: threading.Lock,
+        envelope: FrameEnvelope,
+        detections: List[Tuple[int, float, Tuple[float, float, float, float]]],
+    ) -> List[IncidentEvent]:
+        """Finalize one frame after batched inference."""
+        with stream_lock:
+            return self._finalize_frame_locked(
+                stream_name=envelope.stream_name,
+                frame=envelope.frame,
+                frame_number=envelope.frame_number,
+                timestamp=envelope.timestamp,
+                detections=detections,
+            )
+
+    async def _inference_batch_loop(self) -> None:
+        """Run micro-batch inference and dispatch results back to each stream."""
+        while self.running or not self.inference_queue.empty():
+            try:
+                batch, batch_timed_out = await self._collect_inference_batch()
+            except asyncio.TimeoutError:
+                continue
+
+            try:
+                loop = asyncio.get_running_loop()
+                inference_started = loop.time()
+                detections_by_frame = await self._run_inference_batch(batch)
+                inference_finished = loop.time()
+                inference_duration_ms = max(
+                    0.0,
+                    (inference_finished - inference_started) * 1000.0,
+                )
+                queue_waits_ms = [
+                    max(0.0, (inference_started - envelope.enqueued_at_monotonic) * 1000.0)
+                    for envelope in batch
+                ]
+                self._record_batch_completion(
+                    batch,
+                    batch_timed_out=batch_timed_out,
+                    inference_duration_ms=inference_duration_ms,
+                    queue_waits_ms=queue_waits_ms,
+                )
+                touched_streams = set()
+                for envelope, detections, queue_wait_ms in zip(
+                    batch,
+                    detections_by_frame,
+                    queue_waits_ms,
+                ):
+                    pending_results = self._pending_inference_results.setdefault(
+                        envelope.stream_name,
+                        {},
+                    )
+                    pending_results[envelope.frame_number] = FrameInferenceResult(
+                        envelope=envelope,
+                        detections=detections,
+                        batch_size=len(batch),
+                        batch_timed_out=batch_timed_out,
+                        queue_wait_ms=queue_wait_ms,
+                        inference_duration_ms=inference_duration_ms,
+                        ready_at_monotonic=inference_finished,
+                    )
+                    touched_streams.add(envelope.stream_name)
+                    self.inference_queue.task_done()
+
+                for stream_name in touched_streams:
+                    await self._drain_ready_stream_results(stream_name)
+            except Exception as e:
+                for _ in batch:
+                    self.inference_queue.task_done()
+                self.logger.error(f"Error in inference batch loop: {e}")
 
     async def _process_frame(
         self, stream_name: str, frame: np.ndarray, frame_number: int, timestamp: datetime
     ) -> None:
         """Process a single frame without blocking the event loop."""
         try:
+            if self.settings.yolo.batch_inference_enabled:
+                await self._enqueue_frame_for_batch_inference(
+                    stream_name,
+                    frame,
+                    frame_number,
+                    timestamp,
+                )
+                return
+
             events = await asyncio.to_thread(
                 self._analyze_frame,
                 stream_name,
@@ -169,13 +587,7 @@ class HighwayIncidentDetectionSystem:
                 frame_number,
                 timestamp,
             )
-            for event in events:
-                self.logger.info(
-                    f"Event detected: {event.event_type_value} "
-                    f"on {event.stream_name} at frame {event.frame_number} "
-                    f"(confidence: {event.confidence:.2f})"
-                )
-                await self.event_queue.put(event)
+            await self._process_detected_events(events)
         except Exception as e:
             self.logger.error(f"Error processing frame from {stream_name}: {e}")
 
@@ -222,6 +634,18 @@ class HighwayIncidentDetectionSystem:
                         f"Consecutive failures={model_stats['consecutive_failures']}"
                     )
 
+                if self.settings.yolo.batch_inference_enabled:
+                    batch_stats = self.get_batch_inference_stats()
+                    self.logger.debug(
+                        "Batch stats: "
+                        f"Batches={batch_stats['total_batches']}, "
+                        f"Avg batch={batch_stats['avg_batch_size']:.2f}, "
+                        f"Timeout batches={batch_stats['timeout_batches']}, "
+                        f"Queue={batch_stats['queue_size']}/{batch_stats['queue_capacity']}, "
+                        f"Avg queue wait={batch_stats['avg_queue_wait_ms']:.2f}ms, "
+                        f"Avg postprocess wait={batch_stats['avg_postprocess_wait_ms']:.2f}ms"
+                    )
+
                 stream_status = self.stream_processor.get_stream_status()
                 for stream_name, status in stream_status.items():
                     if not status["is_connected"]:
@@ -243,6 +667,8 @@ class HighwayIncidentDetectionSystem:
 
         event_task = asyncio.create_task(self._process_event_queue())
         self._monitoring_task = asyncio.create_task(self._monitor_resources())
+        if self.settings.yolo.batch_inference_enabled:
+            self._inference_task = asyncio.create_task(self._inference_batch_loop())
         stream_task = asyncio.create_task(self.stream_processor.start())
 
         try:
@@ -282,6 +708,9 @@ class HighwayIncidentDetectionSystem:
 
             await self.shutdown()
 
+            if self._inference_task and not self._inference_task.done():
+                await self._inference_task
+
             if not event_task.done():
                 await event_task
 
@@ -294,6 +723,15 @@ class HighwayIncidentDetectionSystem:
             await asyncio.wait_for(self.stream_processor.stop(), timeout=5.0)
         except asyncio.TimeoutError:
             self.logger.warning("Stream processor stop timeout, forcing shutdown")
+
+        if self._inference_task:
+            try:
+                await asyncio.wait_for(self.inference_queue.join(), timeout=5.0)
+            except asyncio.TimeoutError:
+                self.logger.warning("Inference queue drain timeout")
+
+            if not self._inference_task.done():
+                await self._inference_task
 
         try:
             await asyncio.wait_for(self.event_queue.join(), timeout=5.0)
