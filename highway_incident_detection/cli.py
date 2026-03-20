@@ -4,15 +4,8 @@ import asyncio
 import signal
 import sys
 import argparse
-from pathlib import Path
 
-# Add parent directory to path to import from main.py
-# This allows the CLI to work both as a package entry point and standalone
-_parent_dir = Path(__file__).parent.parent
-if str(_parent_dir) not in sys.path:
-    sys.path.insert(0, str(_parent_dir))
-
-from main import HighwayIncidentDetectionSystem
+from highway_incident_detection.system import HighwayIncidentDetectionSystem
 
 
 def main():
@@ -59,4 +52,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

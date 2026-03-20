@@ -235,6 +235,10 @@ class OutputConfig(BaseSettings):
         default="./output/summaries",
         description="Directory for summary files"
     )
+    audit_dir: str = Field(
+        default="./output/audits",
+        description="Directory for audit files"
+    )
     video_duration_seconds: int = Field(
         default=10,
         ge=1,
@@ -246,6 +250,59 @@ class OutputConfig(BaseSettings):
         ge=10,
         le=60,
         description="FPS for output videos"
+    )
+
+    model_config = SettingsConfigDict(extra="forbid")
+
+
+class AuditConfig(BaseSettings):
+    """Large-model audit configuration."""
+
+    enabled: bool = Field(
+        default=False,
+        description="Enable large-model audit for detected events"
+    )
+    provider: str = Field(
+        default="openai_compatible",
+        description="Audit provider type"
+    )
+    endpoint: Optional[str] = Field(
+        default=None,
+        description="OpenAI-compatible chat completion endpoint"
+    )
+    api_key: Optional[str] = Field(
+        default=None,
+        description="API key used by the audit provider"
+    )
+    model_name: str = Field(
+        default="gpt-4.1-mini",
+        description="Model name used for event audit"
+    )
+    timeout_seconds: int = Field(
+        default=20,
+        ge=1,
+        le=120,
+        description="Timeout in seconds for a single audit request"
+    )
+    max_images: int = Field(
+        default=3,
+        ge=1,
+        le=6,
+        description="Maximum number of images sampled for each audit"
+    )
+    sample_video_frames: bool = Field(
+        default=True,
+        description="Whether to sample frames from the generated event video"
+    )
+    min_event_confidence: float = Field(
+        default=0.35,
+        ge=0.0,
+        le=1.0,
+        description="Minimum detector confidence required before sending an audit request"
+    )
+    save_raw_response: bool = Field(
+        default=False,
+        description="Whether to persist raw model response in audit output"
     )
 
     model_config = SettingsConfigDict(extra="forbid")
@@ -285,6 +342,7 @@ class Settings(BaseSettings):
     event: EventConfig = Field(default_factory=EventConfig)
     stream: StreamConfig = Field(default_factory=StreamConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
+    audit: AuditConfig = Field(default_factory=AuditConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     lane: LaneConfig = Field(default_factory=LaneConfig)
 
@@ -313,4 +371,3 @@ def get_settings() -> Settings:
     if _settings is None:
         _settings = Settings()
     return _settings
-

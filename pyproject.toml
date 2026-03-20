@@ -70,11 +70,11 @@ Issues = "https://github.com/M4D-AI/highway-incident-detection/issues"
 highway-incident-detection = "highway_incident_detection.cli:main"
 highway-detection = "highway_incident_detection.cli:main"  # 简短别名
 
-[tool.setuptools]
-packages = ["highway_incident_detection"]
-
 [tool.setuptools.package-data]
 "highway_incident_detection" = ["py.typed"]
+
+[tool.setuptools.packages.find]
+include = ["highway_incident_detection*"]
 
 [tool.black]
 line-length = 100
@@ -144,7 +144,6 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
-asyncio_mode = "auto"
 addopts = [
     "--strict-markers",
     "--strict-config",
@@ -152,4 +151,3 @@ addopts = [
     "--cov-report=term-missing",
     "--cov-report=html",
 ]
-

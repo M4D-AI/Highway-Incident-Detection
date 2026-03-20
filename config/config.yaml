@@ -62,8 +62,21 @@ output:
   keyframe_dir: "./output/keyframes"
   video_dir: "./output/videos"
   summary_dir: "./output/summaries"
+  audit_dir: "./output/audits"
   video_duration_seconds: 10
   video_fps: 25
+
+audit:
+  enabled: false
+  provider: "openai_compatible"
+  endpoint: null  # Example: "https://api.openai.com/v1/chat/completions"
+  api_key: null  # Recommended: inject from environment instead of plain text
+  model_name: "gpt-4.1-mini"
+  timeout_seconds: 20
+  max_images: 3
+  sample_video_frames: true
+  min_event_confidence: 0.35
+  save_raw_response: false
 
 logging:
   log_dir: "./logs"
@@ -80,4 +93,3 @@ lane:
   roi_points: []  # Example: [[100, 100], [500, 100], [500, 400], [100, 400]]
   # Lane direction: "left", "right", "up", "down", or null for bidirectional
   direction: null
-

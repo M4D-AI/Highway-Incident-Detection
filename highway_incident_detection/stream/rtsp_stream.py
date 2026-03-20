@@ -1,11 +1,11 @@
 """RTSP stream processing module with auto-keepalive and reconnection."""
 
 import asyncio
-from typing import Optional, Callable, Dict, Any
-from datetime import datetime, timedelta
+import inspect
+from typing import Callable, Dict, Any
+from datetime import datetime
 import cv2
 import numpy as np
-from collections import deque
 from highway_incident_detection.config.settings import StreamConfig
 from highway_incident_detection.utils.logger import get_logger
 
@@ -32,7 +32,6 @@ class RTSPStreamProcessor:
         self.cap_dict: Dict[str, cv2.VideoCapture] = {}
         self.running = False
         self.tasks: Dict[str, asyncio.Task] = {}
-        self.frame_buffers: Dict[str, deque] = {}
         self.frame_counters: Dict[str, int] = {}
         self.last_frame_time: Dict[str, datetime] = {}
         self.heartbeat_tasks: Dict[str, asyncio.Task] = {}
@@ -76,7 +75,7 @@ class RTSPStreamProcessor:
             cap.set(cv2.CAP_PROP_FPS, 25)  # Set expected FPS
 
             # Try to read a frame to verify connection
-            ret, _ = cap.read()
+            ret, _ = await asyncio.to_thread(cap.read)
             if not ret or not cap.isOpened():
                 cap.release()
                 logger.warning(f"Failed to verify connection to {stream_name}")
@@ -188,7 +187,7 @@ class RTSPStreamProcessor:
                 cap = self.cap_dict[stream_name]
 
                 # Read frame with timeout simulation
-                ret, frame = cap.read()
+                ret, frame = await asyncio.to_thread(cap.read)
 
                 if not ret or frame is None:
                     consecutive_read_failures += 1
@@ -220,7 +219,14 @@ class RTSPStreamProcessor:
 
                 # Call callback (this should be fast, non-blocking)
                 try:
-                    self.frame_callback(stream_name, frame, frame_number, timestamp)
+                    callback_result = self.frame_callback(
+                        stream_name,
+                        frame,
+                        frame_number,
+                        timestamp,
+                    )
+                    if inspect.isawaitable(callback_result):
+                        await callback_result
                 except Exception as e:
                     logger.error(f"Error in frame callback for {stream_name}: {e}")
 

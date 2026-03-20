@@ -2,18 +2,17 @@
 
 from typing import List, Dict, Tuple, Optional
 from collections import defaultdict, deque
-from datetime import datetime, timedelta
+from datetime import datetime
 import numpy as np
 from highway_incident_detection.detectors.event_types import EventType, IncidentEvent
 from highway_incident_detection.config.settings import EventConfig
-from highway_incident_detection.utils.tracker import ObjectTracker, TrackedObject
-from highway_incident_detection.utils.logger import get_logger
-
-logger = get_logger(__name__)
+from highway_incident_detection.utils.tracker import TrackedObject
 
 
 class EventDetector:
     """Detect various highway incidents."""
+
+    VEHICLE_CLASS_IDS = frozenset({2, 3, 5, 7})
 
     def __init__(self, config: EventConfig):
         """Initialize event detector.
@@ -22,10 +21,8 @@ class EventDetector:
             config: Event detection configuration.
         """
         self.config = config
-        self.tracker = ObjectTracker(max_disappeared=5, max_distance=50.0)
 
         # Event state tracking
-        self.event_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=100))
         self.last_event_time: Dict[Tuple[str, EventType], datetime] = {}
         self.construction_frame_count: Dict[str, int] = defaultdict(int)
         self.reverse_tracks: Dict[str, Dict[int, deque]] = defaultdict(
@@ -39,10 +36,14 @@ class EventDetector:
         self.congestion_history: Dict[str, deque] = defaultdict(
             lambda: deque(maxlen=100)
         )
-        # Congestion detection: track vehicle counts and speeds
-        self.congestion_history: Dict[str, deque] = defaultdict(
-            lambda: deque(maxlen=100)
-        )
+
+    def _prune_track_state(self, stream_name: str, active_track_ids: List[int]) -> None:
+        """Remove stale per-track state for disappeared objects."""
+        active_ids = set(active_track_ids)
+        for state_map in (self.reverse_tracks[stream_name], self.parking_tracks[stream_name]):
+            stale_ids = [track_id for track_id in state_map.keys() if track_id not in active_ids]
+            for track_id in stale_ids:
+                del state_map[track_id]
 
     def _is_in_cooldown(
         self, stream_name: str, event_type: EventType, current_time: datetime
@@ -164,9 +165,10 @@ class EventDetector:
             return None
 
         # Track vehicle velocities
+        self._prune_track_state(stream_name, list(tracked_objects.keys()))
         for track_id, obj in tracked_objects.items():
             # Only track vehicles (class IDs 2, 3, 5, 7)
-            if obj.class_id not in [2, 3, 5, 7]:
+            if obj.class_id not in self.VEHICLE_CLASS_IDS:
                 continue
 
             # Calculate speed (pixels per frame) in x direction
@@ -350,9 +352,10 @@ class EventDetector:
             return None
 
         # Track vehicle positions
+        self._prune_track_state(stream_name, list(tracked_objects.keys()))
         for track_id, obj in tracked_objects.items():
             # Only track vehicles (class IDs 2, 3, 5, 7)
-            if obj.class_id not in [2, 3, 5, 7]:
+            if obj.class_id not in self.VEHICLE_CLASS_IDS:
                 continue
 
             # Calculate speed magnitude
@@ -438,7 +441,7 @@ class EventDetector:
         # Filter vehicles only (class IDs 2, 3, 5, 7: car, motorcycle, bus, truck)
         vehicle_detections = [
             d for d in detections
-            if d[0] in [2, 3, 5, 7]
+            if d[0] in self.VEHICLE_CLASS_IDS
         ]
 
         if len(vehicle_detections) < self.config.congestion_min_vehicles:
@@ -449,7 +452,7 @@ class EventDetector:
         # Calculate average speed of tracked vehicles
         vehicle_speeds = []
         for track_id, obj in tracked_objects.items():
-            if obj.class_id in [2, 3, 5, 7]:  # Only vehicles
+            if obj.class_id in self.VEHICLE_CLASS_IDS:  # Only vehicles
                 speed = np.sqrt(obj.velocity[0] ** 2 + obj.velocity[1] ** 2)
                 vehicle_speeds.append(speed)
 
@@ -628,4 +631,3 @@ class EventDetector:
             events.append(congestion_event)
 
         return events
-

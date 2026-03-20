@@ -16,6 +16,7 @@
 - **资源管理**：完善的资源监控、内存管理和故障恢复
 - **实时推理**：基于YOLO模型的高效目标检测
 - **异步摘要生成**：不阻塞实时推理的摘要、关键帧和视频生成
+- **智能审计模块**：支持把事件关键帧和视频采样帧送入大模型进行二次确认与风险分级
 - **可配置参数**：YOLO模型参数、事件参数、视频流参数均可配置
 - **高效日志系统**：精准的日志记录，便于复现与跟踪分析
 
@@ -28,6 +29,9 @@ HighwayIncidentDetection/
 │   ├── config/                    # 配置管理
 │   │   ├── __init__.py
 │   │   └── settings.py
+│   ├── audit/                     # 大模型审计模块
+│   │   ├── __init__.py
+│   │   └── event_auditor.py
 │   ├── models/                    # YOLO模型封装
 │   │   ├── __init__.py
 │   │   └── yolo_model.py
@@ -192,8 +196,25 @@ output:
   keyframe_dir: "./output/keyframes"
   video_dir: "./output/videos"
   summary_dir: "./output/summaries"
+  audit_dir: "./output/audits"
   video_duration_seconds: 10       # 视频时长（秒）
   video_fps: 25                    # 视频FPS
+```
+
+### 大模型审计配置
+
+```yaml
+audit:
+  enabled: true
+  provider: "openai_compatible"
+  endpoint: "https://api.openai.com/v1/chat/completions"
+  api_key: "${OPENAI_API_KEY}"
+  model_name: "gpt-4.1-mini"
+  timeout_seconds: 20
+  max_images: 3
+  sample_video_frames: true
+  min_event_confidence: 0.35
+  save_raw_response: false
 ```
 
 ## 输出说明
@@ -202,7 +223,8 @@ output:
 
 1. **关键帧图片**：包含事件标注的图片，保存在 `output/keyframes/`
 2. **视频片段**：10秒的事件视频，保存在 `output/videos/`
-3. **摘要JSON**：包含事件详细信息的JSON文件，保存在 `output/summaries/`
+3. **摘要JSON**：包含事件详细信息和审计结论的JSON文件，保存在 `output/summaries/`
+4. **审计结果**：大模型或本地策略输出的确认结果与风险等级，写入 summary 中
 
 摘要JSON格式：
 
@@ -221,7 +243,15 @@ output:
     "worker_count": 3
   },
   "keyframe_path": "./output/keyframes/...",
-  "video_path": "./output/videos/..."
+  "video_path": "./output/videos/...",
+  "audit": {
+    "confirmed": true,
+    "risk_level": "high",
+    "reason": "Large model confirmed the event",
+    "reviewer": "llm:gpt-4.1-mini",
+    "confidence": 0.91,
+    "recommended_action": "Escalate to manual verification immediately"
+  }
 }
 ```
 
@@ -267,4 +297,3 @@ output:
 ## 联系方式
 
 [xiezl_cjlu@foxmail.com]
-

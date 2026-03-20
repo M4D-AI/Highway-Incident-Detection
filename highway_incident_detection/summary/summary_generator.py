@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 from collections import deque
 import aiofiles
+from highway_incident_detection.audit.event_auditor import EventAuditor
 from highway_incident_detection.detectors.event_types import IncidentEvent
 from highway_incident_detection.config.settings import OutputConfig
 from highway_incident_detection.utils.logger import get_logger
@@ -19,13 +20,15 @@ logger = get_logger(__name__)
 class SummaryGenerator:
     """Generate summaries, keyframes, and videos asynchronously."""
 
-    def __init__(self, config: OutputConfig):
+    def __init__(self, config: OutputConfig, auditor: Optional[EventAuditor] = None):
         """Initialize summary generator.
 
         Args:
             config: Output configuration.
+            auditor: Optional event auditor for secondary verification.
         """
         self.config = config
+        self.auditor = auditor
         self._create_directories()
 
         # Frame buffers for video generation (stream_name -> deque of frames)
@@ -44,6 +47,7 @@ class SummaryGenerator:
         Path(self.config.keyframe_dir).mkdir(parents=True, exist_ok=True)
         Path(self.config.video_dir).mkdir(parents=True, exist_ok=True)
         Path(self.config.summary_dir).mkdir(parents=True, exist_ok=True)
+        Path(self.config.audit_dir).mkdir(parents=True, exist_ok=True)
 
     def add_frame(
         self,
@@ -67,7 +71,7 @@ class SummaryGenerator:
             self.frame_timestamps[stream_name] = deque(maxlen=buffer_size)
             self.frame_numbers[stream_name] = deque(maxlen=buffer_size)
 
-        self.frame_buffers[stream_name].append(frame.copy())
+        self.frame_buffers[stream_name].append(frame)
         self.frame_timestamps[stream_name].append(timestamp)
         self.frame_numbers[stream_name].append(frame_number)
 
@@ -107,8 +111,7 @@ class SummaryGenerator:
                     2,
                 )
 
-            # Save image
-            cv2.imwrite(str(filepath), output_frame)
+            await asyncio.to_thread(cv2.imwrite, str(filepath), output_frame)
             logger.info(f"Keyframe saved: {filepath}")
 
             return str(filepath)
@@ -144,20 +147,7 @@ class SummaryGenerator:
             # Get frame dimensions
             height, width = frames[0].shape[:2]
 
-            # Create video writer
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            out = cv2.VideoWriter(
-                str(filepath),
-                fourcc,
-                self.config.video_fps,
-                (width, height),
-            )
-
-            # Write frames
-            for frame in frames:
-                out.write(frame)
-
-            out.release()
+            await asyncio.to_thread(self._write_video_file, str(filepath), frames, width, height)
             logger.info(f"Video saved: {filepath}")
 
             return str(filepath)
@@ -165,7 +155,34 @@ class SummaryGenerator:
             logger.error(f"Failed to generate video: {e}")
             return ""
 
-    async def generate_summary(self, event: IncidentEvent, keyframe_path: str, video_path: str) -> str:
+    def _write_video_file(
+        self,
+        filepath: str,
+        frames: List[np.ndarray],
+        width: int,
+        height: int,
+    ) -> None:
+        """Write a video file in a worker thread."""
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(
+            filepath,
+            fourcc,
+            self.config.video_fps,
+            (width, height),
+        )
+        try:
+            for frame in frames:
+                writer.write(frame)
+        finally:
+            writer.release()
+
+    async def generate_summary(
+        self,
+        event: IncidentEvent,
+        keyframe_path: str,
+        video_path: str,
+        audit_result: Optional[Dict[str, Any]] = None,
+    ) -> str:
         """Generate summary JSON file for event.
 
         Args:
@@ -190,6 +207,7 @@ class SummaryGenerator:
                 "metadata": event.metadata,
                 "keyframe_path": keyframe_path,
                 "video_path": video_path,
+                "audit": audit_result,
             }
 
             # Create filename
@@ -209,6 +227,38 @@ class SummaryGenerator:
             return str(filepath)
         except Exception as e:
             logger.error(f"Failed to generate summary: {e}")
+            return ""
+
+    async def generate_audit_record(
+        self,
+        event: IncidentEvent,
+        audit_result: Dict[str, Any],
+    ) -> str:
+        """Persist the audit result as a standalone JSON record."""
+        try:
+            timestamp_str = event.timestamp.strftime("%Y%m%d_%H%M%S")
+            filename = (
+                f"{event.stream_name}_{event.event_type.value}_{timestamp_str}_"
+                f"frame{event.frame_number}.audit.json"
+            )
+            filepath = Path(self.config.audit_dir) / filename
+            payload = {
+                "event_id": (
+                    f"{event.stream_name}_{event.event_type.value}_"
+                    f"{event.timestamp.isoformat()}"
+                ),
+                "stream_name": event.stream_name,
+                "event_type": event.event_type.value,
+                "timestamp": event.timestamp.isoformat(),
+                "frame_number": event.frame_number,
+                "audit": audit_result,
+            }
+            async with aiofiles.open(filepath, "w", encoding="utf-8") as f:
+                await f.write(json.dumps(payload, indent=2, ensure_ascii=False))
+            logger.info(f"Audit record saved: {filepath}")
+            return str(filepath)
+        except Exception as e:
+            logger.error(f"Failed to save audit record: {e}")
             return ""
 
     async def process_event(self, event: IncidentEvent) -> None:
@@ -259,21 +309,32 @@ class SummaryGenerator:
 
             video_path = await self.generate_video(event, video_frames)
 
+            audit_summary: Optional[Dict[str, Any]] = None
+            if self.auditor and self.auditor.enabled:
+                audit = await self.auditor.audit_event(event, keyframe_path, video_path)
+                audit_summary = audit.to_dict(
+                    include_raw_response=self.auditor.config.save_raw_response
+                )
+                await self.generate_audit_record(event, audit_summary)
+
             # Generate summary
-            await self.generate_summary(event, keyframe_path, video_path)
+            await self.generate_summary(event, keyframe_path, video_path, audit_summary)
 
         except Exception as e:
             logger.error(f"Error processing event: {e}")
 
     async def _process_event_queue(self) -> None:
         """Process events from queue asynchronously."""
-        while self.running:
+        while self.running or not self.event_queue.empty():
             try:
                 # Wait for event with timeout
                 event = await asyncio.wait_for(
                     self.event_queue.get(), timeout=1.0
                 )
-                await self.process_event(event)
+                try:
+                    await self.process_event(event)
+                finally:
+                    self.event_queue.task_done()
             except asyncio.TimeoutError:
                 continue
             except Exception as e:
@@ -295,8 +356,8 @@ class SummaryGenerator:
 
     async def stop(self) -> None:
         """Stop summary generator."""
+        await self.event_queue.join()
         self.running = False
         if self.processing_task:
             await self.processing_task
         logger.info("Summary generator stopped")
-
