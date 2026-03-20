@@ -458,7 +458,19 @@ class HighwayIncidentDetectionSystem:
         with self._inference_lock:
             if len(images) == 1:
                 return [self.yolo_model.predict(images[0], verbose=False)]
-            return self.yolo_model.predict_batch(images, verbose=False)
+            detections_by_frame = self.yolo_model.predict_batch(images, verbose=False)
+
+        if len(detections_by_frame) != len(batch):
+            self.logger.warning(
+                "Batch inference returned mismatched result count: "
+                f"expected={len(batch)}, actual={len(detections_by_frame)}. "
+                "Missing results will be filled with empty detections."
+            )
+            detections_by_frame = list(detections_by_frame[: len(batch)])
+            if len(detections_by_frame) < len(batch):
+                detections_by_frame.extend([[] for _ in range(len(batch) - len(detections_by_frame))])
+
+        return detections_by_frame
 
     async def _drain_ready_stream_results(self, stream_name: str) -> None:
         """Process ready inference results for one stream in strict frame order."""
@@ -557,14 +569,14 @@ class HighwayIncidentDetectionSystem:
                         ready_at_monotonic=inference_finished,
                     )
                     touched_streams.add(envelope.stream_name)
-                    self.inference_queue.task_done()
 
                 for stream_name in touched_streams:
                     await self._drain_ready_stream_results(stream_name)
             except Exception as e:
+                self.logger.error(f"Error in inference batch loop: {e}")
+            finally:
                 for _ in batch:
                     self.inference_queue.task_done()
-                self.logger.error(f"Error in inference batch loop: {e}")
 
     async def _process_frame(
         self, stream_name: str, frame: np.ndarray, frame_number: int, timestamp: datetime

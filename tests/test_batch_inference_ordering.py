@@ -95,3 +95,54 @@ def test_process_frame_uses_batch_queue_when_enabled():
 
     assert captured["stream_name"] == "cam_1"
     assert captured["frame_number"] == 7
+
+
+def test_run_inference_batch_fills_missing_results():
+    system = HighwayIncidentDetectionSystem.__new__(HighwayIncidentDetectionSystem)
+    system._inference_lock = threading.Lock()
+    system.logger = SimpleNamespace(warning=lambda *args, **kwargs: None)
+    system.yolo_model = SimpleNamespace(
+        predict_batch=lambda images, verbose=False: [[]],
+    )
+
+    batch = [
+        FrameEnvelope("cam_1", np.zeros((4, 4, 3), dtype=np.uint8), 1, datetime.now()),
+        FrameEnvelope("cam_2", np.zeros((4, 4, 3), dtype=np.uint8), 2, datetime.now()),
+    ]
+
+    results = asyncio.run(system._run_inference_batch(batch))
+
+    assert len(results) == 2
+    assert results[0] == []
+    assert results[1] == []
+
+
+def test_inference_batch_loop_does_not_double_ack_on_finalize_error():
+    system = HighwayIncidentDetectionSystem.__new__(HighwayIncidentDetectionSystem)
+    system.running = False
+    system.settings = SimpleNamespace(
+        yolo=SimpleNamespace(
+            batch_timeout_ms=1,
+            max_batch_size=4,
+        )
+    )
+    system.inference_queue = asyncio.Queue()
+    system.inference_queue.put_nowait(
+        FrameEnvelope("cam_1", np.zeros((4, 4, 3), dtype=np.uint8), 1, datetime.now())
+    )
+    system._pending_inference_results = {}
+    system._record_batch_completion = lambda *args, **kwargs: None
+    system._run_inference_batch = lambda batch: asyncio.sleep(0, result=[[]])
+    system._drain_ready_stream_results = lambda stream_name: asyncio.sleep(
+        0, result=(_ for _ in ()).throw(RuntimeError("boom"))
+    )
+    errors = []
+    system.logger = SimpleNamespace(
+        error=lambda message: errors.append(message),
+        warning=lambda *args, **kwargs: None,
+    )
+
+    asyncio.run(system._inference_batch_loop())
+    asyncio.run(asyncio.wait_for(system.inference_queue.join(), timeout=0.1))
+
+    assert errors

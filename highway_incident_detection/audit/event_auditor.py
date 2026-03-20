@@ -6,7 +6,7 @@ import json
 from dataclasses import dataclass
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib import error, request
 
 import cv2
@@ -189,7 +189,7 @@ class EventAuditor:
         }
         return payload
 
-    def _resolve_prompts(self, event: IncidentEvent) -> tuple[str, str]:
+    def _resolve_prompts(self, event: IncidentEvent) -> Tuple[str, str]:
         """Resolve system and user prompts for one event."""
         event_override = self._get_event_prompt_override(event.event_type_value)
         system_prompt = self._load_prompt_text(

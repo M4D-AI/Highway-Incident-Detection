@@ -312,6 +312,7 @@ class OutputConfig(BaseSettings):
 
     model_config = SettingsConfigDict(extra="forbid")
 
+
 class AuditPromptOverrideConfig(BaseSettings):
     """Per-event audit prompt override configuration."""
 
@@ -474,7 +475,7 @@ class Settings(BaseSettings):
         """Load settings from YAML file."""
         import yaml
         with open(yaml_path, "r", encoding="utf-8") as f:
-            config_dict = yaml.safe_load(f)
+            config_dict = yaml.safe_load(f) or {}
         return cls(**config_dict)
 
 

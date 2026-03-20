@@ -2,8 +2,7 @@
 
 from typing import List, Tuple, Optional
 import numpy as np
-import cv2
-from datetime import datetime, timedelta
+from datetime import datetime
 from ultralytics import YOLO
 from highway_incident_detection.config.settings import YOLOConfig
 from highway_incident_detection.utils.logger import get_logger
@@ -173,6 +172,15 @@ class YOLOModel:
         Returns:
             List of detection lists, one per image.
         """
+        if not self._check_health():
+            if self.config.auto_restart:
+                logger.warning("Model unhealthy before batch inference, attempting restart...")
+                try:
+                    self._load_model()
+                except Exception as e:
+                    logger.error(f"Failed to restart model: {e}")
+                    return [[] for _ in images]
+
         if self.model is None:
             if self.config.auto_restart:
                 try:
