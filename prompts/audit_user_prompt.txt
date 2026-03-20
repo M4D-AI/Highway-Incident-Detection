@@ -1,0 +1,11 @@
+Please review whether this highway event is real.
+Event type: {event_type}
+Detector confidence: {confidence:.2f}
+Stream name: {stream_name}
+Frame number: {frame_number}
+Timestamp: {timestamp}
+Description: {description}
+Metadata: {metadata_json}
+
+Return risk_level as one of: {risk_levels}.
+If the evidence is weak, set confirmed to false.
