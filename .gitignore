@@ -49,6 +49,7 @@ logs/
 
 # Model files
 *.pt
+!yolov8x13.pt
 *.onnx
 *.engine
 
