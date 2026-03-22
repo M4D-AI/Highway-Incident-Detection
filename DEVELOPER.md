@@ -25,7 +25,7 @@ flowchart LR
 ## 模块职责
 
 - `highway_incident_detection/system.py`
-  系统装配、生命周期管理、组件初始化、事件队列、微批推理调度，以及批处理运行时统计。
+  系统装配、生命周期管理、组件初始化、事件队列、微批推理调度、按流事件过滤、多车道 ROI 分发，以及批处理运行时统计。
 
 - `highway_incident_detection/stream/rtsp_stream.py`
   取流、重连、心跳、背压控制、在途帧上限控制。
@@ -34,7 +34,22 @@ flowchart LR
   YOLO 推理封装、单帧/批量推理、失败恢复、推理统计。
 
 - `highway_incident_detection/detectors/event_detector.py`
-  内置事件检测逻辑与注册式 detector 扩展入口。
+  内置事件检测逻辑、按事件类型过滤，以及注册式 detector 扩展入口。
+
+## 车道与按流事件控制
+
+- `stream.streams[*].enabled_event_types`
+  当前流仅启用列出的事件
+
+- `stream.streams[*].disabled_event_types`
+  当前流禁用列出的事件
+
+- `stream.streams[*].lane.zones`
+  一个摄像头可拆成多个 ROI 区域，每个区域独立配置 `name`、`roi_points`、`direction`
+
+- 多 `lane zone` 会各自维护 tracker 和事件状态，内部用 `stream_name::zone_name` 隔离
+
+- 对外输出时仍保留原始 `stream_name`，并在事件 `metadata.lane_zone` 中附带命中的车道区域名
 
 - `highway_incident_detection/detectors/loader.py`
   从 `module:callable` 配置自动加载自定义 detector。

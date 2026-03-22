@@ -76,25 +76,33 @@ class YOLOConfig(BaseSettings):
 class EventConfig(BaseSettings):
     """Event detection configuration."""
 
-    # Class IDs for different events (COCO dataset mapping)
+    # Class IDs for different events.
+    vehicle_class_ids: List[int] = Field(
+        default=[2, 3, 5, 7],
+        description="Class IDs treated as vehicles for reverse, parking, and congestion detection"
+    )
     construction_vehicle_class_ids: List[int] = Field(
-        default=[2, 3, 5, 7],  # car, motorcycle, bus, truck
-        description="Class IDs for construction vehicles"
+        default=[2, 3, 5, 7],
+        description="Class IDs that indicate a construction scene"
     )
     worker_class_id: int = Field(
-        default=0,  # person
+        default=0,
         description="Class ID for workers"
+    )
+    construction_require_worker: bool = Field(
+        default=True,
+        description="Whether construction detection requires worker class to appear together with construction classes"
     )
     motorcycle_class_id: int = Field(
         default=3,
         description="Class ID for motorcycles"
     )
     pedestrian_class_id: int = Field(
-        default=0,  # person
+        default=0,
         description="Class ID for pedestrians"
     )
     debris_class_ids: List[int] = Field(
-        default=[24, 25, 26, 27, 28],  # Various objects that could be debris
+        default=[24, 25, 26, 27, 28],
         description="Class IDs for road debris"
     )
 
@@ -252,6 +260,25 @@ class StreamConfig(BaseSettings):
     model_config = SettingsConfigDict(extra="forbid")
 
 
+class LaneZoneConfig(BaseSettings):
+    """One lane zone with its own ROI and expected direction."""
+
+    name: str = Field(
+        default="default",
+        description="Unique lane zone name within one stream"
+    )
+    roi_points: List[Tuple[int, int]] = Field(
+        default_factory=list,
+        description="ROI polygon points for this lane zone"
+    )
+    direction: Optional[str] = Field(
+        default=None,
+        description="Expected direction for this lane zone: 'left', 'right', 'up', 'down', or None"
+    )
+
+    model_config = SettingsConfigDict(extra="forbid")
+
+
 class LaneConfig(BaseSettings):
     """Lane configuration for ROI and direction."""
 
@@ -269,6 +296,10 @@ class LaneConfig(BaseSettings):
     direction: Optional[str] = Field(
         default=None,
         description="Lane direction: 'left', 'right', 'up', 'down', or None for bidirectional"
+    )
+    zones: List[LaneZoneConfig] = Field(
+        default_factory=list,
+        description="Optional multiple lane zones, each with its own ROI and direction"
     )
 
     model_config = SettingsConfigDict(extra="forbid")

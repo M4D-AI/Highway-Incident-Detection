@@ -15,8 +15,10 @@ yolo:
   batch_queue_size: 64
 
 event:
+  vehicle_class_ids: [2, 3, 5, 7]
   construction_vehicle_class_ids: [2, 3, 5, 7]
   worker_class_id: 0
+  construction_require_worker: true
   motorcycle_class_id: 3
   pedestrian_class_id: 0
   debris_class_ids: [24, 25, 26, 27, 28]
@@ -43,13 +45,28 @@ stream:
     - name: "stream_1"
       url: "data/parking.mp4"
       enabled: true
+      disabled_event_types: []  # Example: ["reverse_vehicle"]
       lane:
         enabled: false
         roi_points: []
         direction: null
+        zones: []
+        # zones:
+        #   - name: "main_right"
+        #     roi_points: [[260, 339], [510, 339], [490, 168], [430, 170], [332, 238]]
+        #     direction: "right"
+        #   - name: "far_left"
+        #     roi_points: [[0, 192], [250, 192], [438, 154], [438, 126], [210, 132], [0, 150]]
+        #     direction: "left"
     - name: "stream_2"
       url: "data/trash.mp4"
       enabled: true
+      enabled_event_types: []  # Example: ["road_debris"]
+      lane:
+        enabled: false
+        roi_points: []
+        direction: null
+        zones: []
   frame_skip: 1
   buffer_size: 30
   reconnect_interval: 5
@@ -98,3 +115,4 @@ lane:
   enabled: false
   roi_points: []
   direction: null
+  zones: []

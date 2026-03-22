@@ -1,7 +1,7 @@
 """Event detection logic."""
 
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 from collections import defaultdict, deque
 from datetime import datetime
 import numpy as np
@@ -29,6 +29,7 @@ class EventDetectionContext:
     timestamp: datetime
     frame_width: Optional[int] = None
     frame_height: Optional[int] = None
+    lane_direction: Optional[str] = None
 
 
 DetectorOutput = Optional[Union[IncidentEvent, Sequence[IncidentEvent]]]
@@ -48,8 +49,6 @@ class RegisteredEventDetector:
 class EventDetector:
     """Detect various highway incidents."""
 
-    VEHICLE_CLASS_IDS = frozenset({2, 3, 5, 7})
-
     def __init__(self, config: EventConfig):
         """Initialize event detector.
 
@@ -57,6 +56,7 @@ class EventDetector:
             config: Event detection configuration.
         """
         self.config = config
+        self.vehicle_class_ids = frozenset(config.vehicle_class_ids)
 
         # Event state tracking
         self.last_event_time: Dict[Tuple[str, str], datetime] = {}
@@ -96,6 +96,7 @@ class EventDetector:
                 ctx.stream_name,
                 ctx.frame_number,
                 ctx.timestamp,
+                ctx.lane_direction,
             ),
             built_in=True,
         )
@@ -302,20 +303,22 @@ class EventDetector:
             if d[0] == self.config.worker_class_id
         ]
 
-        if len(construction_vehicles) > 0 and len(workers) > 0:
+        has_construction_scene = len(construction_vehicles) > 0 or len(workers) > 0
+        if self.config.construction_require_worker:
+            has_construction_scene = len(construction_vehicles) > 0 and len(workers) > 0
+
+        if has_construction_scene:
             self.construction_frame_count[stream_name] += 1
             if self.construction_frame_count[stream_name] >= self.config.construction_detection_frames:
                 # Reset counter
                 self.construction_frame_count[stream_name] = 0
 
                 # Calculate average confidence
-                avg_conf = (
-                    sum(v[1] for v in construction_vehicles) +
-                    sum(w[1] for w in workers)
-                ) / (len(construction_vehicles) + len(workers))
+                construction_targets = construction_vehicles + workers
+                avg_conf = sum(item[1] for item in construction_targets) / len(construction_targets)
 
-                # Use first vehicle bbox as reference
-                bbox = construction_vehicles[0][2]
+                # Use the highest-confidence construction target as reference
+                bbox = max(construction_targets, key=lambda item: item[1])[2]
 
                 self._update_event_time(stream_name, EventType.CONSTRUCTION, timestamp)
                 return IncidentEvent(
@@ -325,10 +328,14 @@ class EventDetector:
                     frame_number=frame_number,
                     confidence=avg_conf,
                     bbox=bbox,
-                    description=f"Construction detected: {len(construction_vehicles)} vehicles, {len(workers)} workers",
+                    description=(
+                        "Construction detected: "
+                        f"{len(construction_vehicles)} construction targets, {len(workers)} workers"
+                    ),
                     metadata={
-                        "vehicle_count": len(construction_vehicles),
+                        "construction_object_count": len(construction_vehicles),
                         "worker_count": len(workers),
+                        "require_worker": self.config.construction_require_worker,
                     },
                 )
         else:
@@ -343,6 +350,7 @@ class EventDetector:
         stream_name: str,
         frame_number: int,
         timestamp: datetime,
+        lane_direction: Optional[str] = None,
     ) -> Optional[IncidentEvent]:
         """Detect reverse vehicle events.
 
@@ -361,15 +369,16 @@ class EventDetector:
         # Track vehicle velocities
         self._prune_track_state(stream_name, list(tracked_objects.keys()))
         for track_id, obj in tracked_objects.items():
-            # Only track vehicles (class IDs 2, 3, 5, 7)
-            if obj.class_id not in self.VEHICLE_CLASS_IDS:
+            if obj.class_id not in self.vehicle_class_ids:
                 continue
 
-            # Calculate speed (pixels per frame) in x direction
-            speed_x = obj.velocity[0]
+            motion_component = self._get_directional_velocity_component(
+                obj.velocity,
+                lane_direction,
+            )
 
             # Store velocity history
-            self.reverse_tracks[stream_name][track_id].append(speed_x)
+            self.reverse_tracks[stream_name][track_id].append(motion_component)
 
             # Check if consistently moving backwards
             if len(self.reverse_tracks[stream_name][track_id]) >= self.config.reverse_detection_frames:
@@ -390,6 +399,7 @@ class EventDetector:
                         metadata={
                             "track_id": track_id,
                             "average_velocity": float(avg_velocity),
+                            "lane_direction": lane_direction,
                         },
                     )
 
@@ -548,8 +558,7 @@ class EventDetector:
         # Track vehicle positions
         self._prune_track_state(stream_name, list(tracked_objects.keys()))
         for track_id, obj in tracked_objects.items():
-            # Only track vehicles (class IDs 2, 3, 5, 7)
-            if obj.class_id not in self.VEHICLE_CLASS_IDS:
+            if obj.class_id not in self.vehicle_class_ids:
                 continue
 
             # Calculate speed magnitude
@@ -632,10 +641,10 @@ class EventDetector:
         if self._is_in_cooldown(stream_name, EventType.CONGESTION, timestamp):
             return None
 
-        # Filter vehicles only (class IDs 2, 3, 5, 7: car, motorcycle, bus, truck)
+        # Filter configured vehicle classes only.
         vehicle_detections = [
             d for d in detections
-            if d[0] in self.VEHICLE_CLASS_IDS
+            if d[0] in self.vehicle_class_ids
         ]
 
         if len(vehicle_detections) < self.config.congestion_min_vehicles:
@@ -646,7 +655,7 @@ class EventDetector:
         # Calculate average speed of tracked vehicles
         vehicle_speeds = []
         for track_id, obj in tracked_objects.items():
-            if obj.class_id in self.VEHICLE_CLASS_IDS:  # Only vehicles
+            if obj.class_id in self.vehicle_class_ids:
                 speed = np.sqrt(obj.velocity[0] ** 2 + obj.velocity[1] ** 2)
                 vehicle_speeds.append(speed)
 
@@ -760,6 +769,9 @@ class EventDetector:
         timestamp: datetime,
         frame_width: Optional[int] = None,
         frame_height: Optional[int] = None,
+        lane_direction: Optional[str] = None,
+        enabled_event_types: Optional[Set[str]] = None,
+        disabled_event_types: Optional[Set[str]] = None,
     ) -> List[IncidentEvent]:
         """Process frame and detect all events.
 
@@ -781,9 +793,15 @@ class EventDetector:
             timestamp=timestamp,
             frame_width=frame_width,
             frame_height=frame_height,
+            lane_direction=lane_direction,
         )
         events: List[IncidentEvent] = []
         for registered_detector in self._registered_detectors:
+            event_name = event_type_name(registered_detector.event_type)
+            if enabled_event_types is not None and event_name not in enabled_event_types:
+                continue
+            if disabled_event_types and event_name in disabled_event_types:
+                continue
             try:
                 detector_output = registered_detector.handler(self, context)
             except Exception as e:
@@ -800,3 +818,23 @@ class EventDetector:
                 continue
             events.extend(detector_output)
         return events
+
+    @staticmethod
+    def _get_directional_velocity_component(
+        velocity: Tuple[float, float],
+        lane_direction: Optional[str],
+    ) -> float:
+        """Project velocity onto the configured lane direction.
+
+        Positive values mean moving with lane direction. Negative values mean reverse motion.
+        """
+        vx, vy = velocity
+        if lane_direction == "right":
+            return vx
+        if lane_direction == "left":
+            return -vx
+        if lane_direction == "down":
+            return vy
+        if lane_direction == "up":
+            return -vy
+        return vx

@@ -1,30 +1,57 @@
-# Highway Incident Detection System
+# Highway Incident Detection
 
-高速公路事件监测系统，基于 YOLO 做目标检测，支持多路视频流、事件识别、证据落盘、结果外发，以及大模型二次审计。
+> Detect highway incidents from RTSP streams or local videos, generate evidence packages, and optionally send every alert through an LLM audit pipeline.
+>
+> 基于 YOLO 的高速事件检测系统，支持 RTSP / 本地视频、多事件识别、证据落盘、结果外发，以及大模型二次复核。
 
-## 适合做什么
+![Parking Sample](docs/assets/parking_sample.jpg)
 
-- 高速公路 / 园区道路视频事件检测
-- RTSP 或本地视频流接入
-- 事件结果外发到 Webhook、Kafka、Redis 或自定义系统
-- 通过自定义 detector 快速扩展业务规则
+## Why This Project | 项目亮点
 
-## 核心能力
+**For GitHub readers**
 
-- 内置事件：施工、逆行、摩托车、行人、抛洒物、异常停车、拥堵
-- 多路流处理与背压控制
-- 关键帧、视频片段、摘要 JSON 输出
-- 多模态大模型审计与风险分级
-- 自定义结果 handler
-- 自定义事件 detector
+- Built for real roadside monitoring workflows, not just offline object detection demos
+- Handles multi-stream inference, event logic, evidence export, and downstream integrations in one codebase
+- Supports lane-aware ROI zoning, per-stream event enable/disable, and custom detector extensions
+- Can attach an LLM audit stage to reduce false positives before pushing results outward
 
-## 快速开始
+**面向真实业务场景**
 
-### 安装
+- 不只是“检测框”，而是完整的事件处理链路
+- 支持多路视频流、事件规则、关键帧/视频/摘要输出、Webhook/Kafka/Redis 外发
+- 支持按车道 ROI、按流控制事件类型、自定义 detector
+- 可接入多模态大模型做事件复核，降低误报
+
+## What It Detects | 支持事件
+
+- `construction` / 施工
+- `reverse_vehicle` / 逆行
+- `motorcycle` / 摩托车
+- `pedestrian` / 行人
+- `road_debris` / 抛洒物
+- `abnormal_parking` / 异常停车
+- `congestion` / 拥堵
+
+## Example Data | 示例数据
+
+The repository ships with two local sample videos under [`data/`](data/).
+
+仓库自带两段本地示例视频，可直接用于调试和演示。
+
+| File | Preview | Scenario | Recommended focus |
+| --- | --- | --- | --- |
+| [`data/parking.mp4`](data/parking.mp4) | ![parking preview](docs/assets/parking_sample.jpg) | Highway split / merge scene with main lanes, opposite lanes, and a diverging ramp | ROI zoning, abnormal parking, per-stream event filtering |
+| [`data/trash.mp4`](data/trash.mp4) | ![trash preview](docs/assets/trash_sample.jpg) | Highway scene suitable for road debris testing | Road debris detection, lane ROI tuning |
+
+## Quick Start | 快速开始
+
+### Install | 安装
 
 ```bash
 pip install .
 ```
+
+For development:
 
 开发环境：
 
@@ -32,85 +59,172 @@ pip install .
 pip install -e ".[dev]"
 ```
 
+If you need Kafka / Redis handlers:
+
 如果要使用 Kafka / Redis handler：
 
 ```bash
 pip install -e ".[integrations]"
 ```
 
-### 运行
+### Run | 运行
 
 ```bash
 highway-incident-detection --config config/config.yaml
 ```
 
-或：
+or
 
 ```bash
 python main.py --config config/config.yaml
 ```
 
-GPU 多流场景建议直接从 [config/gpu_batch_config.yaml](/Users/xiezhanlong/PycharmProjects/HighwayIncidentDetection/config/gpu_batch_config.yaml) 起步：
+For GPU multi-stream inference, start from [`config/gpu_batch_config.yaml`](config/gpu_batch_config.yaml):
+
+GPU 多流场景建议直接从 [`config/gpu_batch_config.yaml`](config/gpu_batch_config.yaml) 起步：
 
 ```bash
 highway-incident-detection --config config/gpu_batch_config.yaml
 ```
 
-## 最常用配置
+## What You Get | 输出内容
 
-默认配置在 [config/config.yaml](/Users/xiezhanlong/PycharmProjects/HighwayIncidentDetection/config/config.yaml)。
-GPU 微批示例在 [config/gpu_batch_config.yaml](/Users/xiezhanlong/PycharmProjects/HighwayIncidentDetection/config/gpu_batch_config.yaml)。
+By default the system generates:
 
-```yaml
-yolo:
-  model_path: "yolov8n.pt"
-  confidence_threshold: 0.5
-  device: "cpu"
-  batch_inference_enabled: true
-  max_batch_size: 4
-  batch_timeout_ms: 15
-
-stream:
-  frame_skip: 1
-  max_pending_frames: 2
-  drop_frames_when_busy: true
-
-audit:
-  enabled: false
-  model_name: "gpt-4.1-mini"
-  user_prompt_path: "./prompts/audit_user.txt"
-```
-
-## 输出结果
-
-系统默认会生成：
+默认情况下，系统会生成：
 
 - `output/keyframes/`
 - `output/videos/`
 - `output/summaries/`
 - `output/audits/`
 
-同时支持对外推送统一结果对象 `EventResult`。
-`summary JSON` 和 `EventResult` 会带 `processing_metrics`，可直接拿到批大小、排队等待和后处理等待。
+Each event can produce:
 
-## 审计 Prompt 自定义
+每个事件可产出：
 
-审计模块支持直接改 prompt，不需要改代码。可选两种方式：
+- a keyframe image / 关键帧图片
+- a video clip / 事件视频片段
+- a summary JSON / 摘要 JSON
+- optional audit output / 可选的大模型复核结果
 
-- 在配置里直接写 `audit.system_prompt` 和 `audit.user_prompt_template`
-- 用 `audit.system_prompt_path` 和 `audit.user_prompt_path` 指向外部文本文件
-- 用 `audit.event_prompt_overrides.<event_type>` 为某个事件单独覆盖 prompt，未命中时仍走全局默认
+## Core Capabilities | 核心能力
 
-`user_prompt_template` 支持这些占位符：
+- Multi-stream processing with backpressure control
+- YOLO single-frame and batch inference
+- Lane ROI filtering with multi-zone support
+- Per-stream event type filtering
+- Unified `EventResult` output for downstream systems
+- HTTP webhook / Kafka / Redis integrations
+- Custom detectors loaded from `module:callable`
+- LLM audit with global or per-event prompt overrides
 
-- `{event_type}`
-- `{confidence}`
-- `{description}`
-- `{stream_name}`
-- `{frame_number}`
-- `{timestamp}`
-- `{metadata_json}`
-- `{risk_levels}`
+- 多路流处理与背压控制
+- YOLO 单帧 / 批量推理
+- 支持多车道 ROI 分区
+- 支持按流启用 / 禁用事件类型
+- 统一 `EventResult` 输出协议
+- HTTP Webhook / Kafka / Redis 外发
+- 支持 `module:callable` 形式自定义事件
+- 支持全局或按事件的 LLM 复核 prompt
+
+## Configuration Patterns | 常用配置模式
+
+Default config:
+
+默认配置：
+
+- [`config/config.yaml`](config/config.yaml)
+
+GPU batch example:
+
+GPU 微批配置示例：
+
+- [`config/gpu_batch_config.yaml`](config/gpu_batch_config.yaml)
+
+### Per-stream Event Control | 按流控制事件类型
+
+```yaml
+stream:
+  streams:
+    - name: "parking_cam"
+      url: "data/parking.mp4"
+      disabled_event_types: ["reverse_vehicle"]
+
+    - name: "trash_cam"
+      url: "data/trash.mp4"
+      enabled_event_types: ["road_debris"]
+```
+
+- `enabled_event_types`: only run listed event detectors
+- `disabled_event_types`: skip listed event detectors
+- If both are present, allow-list is applied first, then deny-list
+
+- `enabled_event_types`：只运行列出的事件
+- `disabled_event_types`：跳过列出的事件
+- 两者同时配置时，先应用白名单，再应用黑名单
+
+### Multi-lane ROI Zones | 多车道 ROI 分区
+
+```yaml
+stream:
+  streams:
+    - name: "parking_cam"
+      url: "data/parking.mp4"
+      lane:
+        enabled: true
+        zones:
+          - name: "main_right"
+            roi_points: [[260, 339], [510, 339], [490, 168], [430, 170], [332, 238]]
+            direction: "right"
+          - name: "ramp_right"
+            roi_points: [[510, 339], [639, 339], [639, 140], [575, 135], [490, 168]]
+            direction: "right"
+          - name: "far_left"
+            roi_points: [[0, 192], [250, 192], [438, 154], [438, 126], [210, 132], [0, 150]]
+            direction: "left"
+```
+
+- Each zone has its own ROI, direction, tracker state, and event state
+- Output metadata includes `lane_zone`
+- Old single-ROI config remains supported
+
+- 每个 zone 都有独立的 ROI、方向、tracker 状态和事件状态
+- 输出 metadata 会附带 `lane_zone`
+- 旧的单 ROI 配法仍然兼容
+
+### Minimal Runtime Config | 最小运行配置
+
+```yaml
+yolo:
+  model_path: "yolov8n.pt"
+  confidence_threshold: 0.5
+  device: "cpu"
+
+stream:
+  frame_skip: 1
+  max_pending_frames: 2
+
+audit:
+  enabled: false
+```
+
+## LLM Audit | 大模型复核
+
+The audit layer can verify whether a detector hit is likely real before the result is pushed outward.
+
+审计层可以在结果外发前，对检测命中做一次“是否真实事件”的复核。
+
+Supported prompt customization:
+
+支持的 prompt 自定义方式：
+
+- `audit.system_prompt`
+- `audit.user_prompt_template`
+- `audit.system_prompt_path`
+- `audit.user_prompt_path`
+- `audit.event_prompt_overrides.<event_type>`
+
+Example:
 
 示例：
 
@@ -119,36 +233,20 @@ audit:
   enabled: true
   endpoint: "https://api.openai.com/v1/chat/completions"
   api_key: "${OPENAI_API_KEY}"
-  system_prompt: "你是高速事件复核员，只返回 JSON。"
+  system_prompt: "You are reviewing highway incident detections. Return strict JSON."
   user_prompt_template: |
-    请复核以下事件是否真实：
-    事件类型: {event_type}
-    置信度: {confidence:.2f}
-    流名称: {stream_name}
-    帧号: {frame_number}
-    描述: {description}
-    元数据: {metadata_json}
+    Review this event:
+    type={event_type}
+    confidence={confidence:.2f}
+    stream={stream_name}
+    frame={frame_number}
+    description={description}
+    metadata={metadata_json}
 ```
 
-按事件类型覆盖的示例：
+## Integrations | 结果对接
 
-```yaml
-audit:
-  system_prompt: "你是高速事件复核员，只返回 JSON。"
-  user_prompt_template: "请复核事件 {event_type}。"
-  event_prompt_overrides:
-    pedestrian:
-      system_prompt: "你专门复核行人闯入事件，只返回 JSON。"
-      user_prompt_template: |
-        请重点判断是否真有行人进入车道：
-        流名称: {stream_name}
-        帧号: {frame_number}
-        描述: {description}
-```
-
-## 结果接口
-
-### 自定义 handler
+### Custom Result Handler | 自定义结果处理
 
 ```python
 from highway_incident_detection import EventResult, HighwayIncidentDetectionSystem
@@ -163,14 +261,7 @@ system = HighwayIncidentDetectionSystem(config_path="config/config.yaml")
 system.register_result_handler(handle_result)
 ```
 
-运行中也可以直接读系统快照：
-
-```python
-stats = system.get_runtime_stats()
-print(stats["batch_inference"]["avg_batch_size"])
-```
-
-### 内置 handler
+### Built-in Handlers | 内置处理器
 
 ```python
 from highway_incident_detection import (
@@ -190,9 +281,9 @@ system.register_result_handler(
 )
 ```
 
-## 自定义事件扩展
+## Custom Detectors | 自定义事件扩展
 
-### 代码注册
+### Code Registration | 代码注册
 
 ```python
 from highway_incident_detection import EventDetectionContext, HighwayIncidentDetectionSystem
@@ -221,9 +312,13 @@ system.register_event_detector(
 )
 ```
 
-### 配置自动加载
+### Auto-load from Config | 配置自动加载
 
-示例模块在 [custom_detectors/smoke.py](/Users/xiezhanlong/PycharmProjects/HighwayIncidentDetection/custom_detectors/smoke.py)。
+Example module:
+
+示例模块：
+
+- [`custom_detectors/smoke.py`](custom_detectors/smoke.py)
 
 ```yaml
 event:
@@ -235,37 +330,12 @@ event:
       prepend: true
 ```
 
-## Benchmark
+## Developer Notes | 开发者说明
 
-```bash
-python benchmarks/pipeline_benchmark.py \
-  --video data/parking.mp4 \
-  --duration-seconds 10 \
-  --frame-skips 1,2,4 \
-  --max-pending-frames 1,2,4 \
-  --processing-ms 20 \
-  --handler-profiles none,sync,async,mixed \
-  --handler-delay-ms 10 \
-  --emit-every-n-frames 30
-```
+- Architecture and module responsibilities: [`DEVELOPER.md`](DEVELOPER.md)
+- Installation details: [`INSTALLATION.md`](INSTALLATION.md)
+- Packaging notes: [`PACKAGING.md`](PACKAGING.md)
 
-如果是 GPU 多流场景，建议重点调这几个参数：
+## License
 
-- `yolo.batch_inference_enabled`
-- `yolo.max_batch_size`
-- `yolo.batch_timeout_ms`
-- `yolo.batch_queue_size`
-- `stream.max_pending_frames`
-
-重点观察这些运行时指标：
-
-- `avg_batch_size`
-- `timeout_batches`
-- `avg_queue_wait_ms`
-- `avg_postprocess_wait_ms`
-
-## 文档
-
-- 使用者文档：当前文件
-- 开发者文档：[DEVELOPER.md](/Users/xiezhanlong/PycharmProjects/HighwayIncidentDetection/DEVELOPER.md)
-- 安装细节：[INSTALLATION.md](/Users/xiezhanlong/PycharmProjects/HighwayIncidentDetection/INSTALLATION.md)
+MIT

@@ -84,7 +84,9 @@ class HighwayIncidentDetectionSystem:
 
         self.trackers: Dict[str, ObjectTracker] = {}
         self.lane_configs: Dict[str, Dict] = {}
+        self.stream_event_filters: Dict[str, Dict[str, Optional[set[str]]]] = {}
         self._init_lane_configs()
+        self._init_stream_event_filters()
         self._inference_lock = threading.Lock()
         self._event_detector_lock = threading.Lock()
         self._stream_locks: Dict[str, threading.Lock] = {
@@ -323,17 +325,104 @@ class HighwayIncidentDetectionSystem:
             stream_name = stream_config.get("name")
             lane_config = stream_config.get("lane", {})
             if lane_config:
-                self.lane_configs[stream_name] = {
-                    "enabled": lane_config.get("enabled", False),
-                    "roi_points": lane_config.get("roi_points", []),
-                    "direction": lane_config.get("direction"),
-                }
+                self.lane_configs[stream_name] = self._normalize_lane_config(lane_config)
             else:
-                self.lane_configs[stream_name] = {
-                    "enabled": self.settings.lane.enabled,
-                    "roi_points": self.settings.lane.roi_points,
-                    "direction": self.settings.lane.direction,
+                self.lane_configs[stream_name] = self._normalize_lane_config(
+                    self.settings.lane.model_dump()
+                )
+
+    def _init_stream_event_filters(self) -> None:
+        """Initialize per-stream event filters."""
+        self.stream_event_filters = {}
+        for stream_config in self.settings.stream.streams:
+            stream_name = stream_config.get("name")
+            if not stream_name:
+                continue
+            enabled = stream_config.get("enabled_event_types")
+            disabled = stream_config.get("disabled_event_types")
+            self.stream_event_filters[stream_name] = {
+                "enabled": {str(item) for item in enabled} if enabled else None,
+                "disabled": {str(item) for item in disabled} if disabled else None,
+            }
+
+    @staticmethod
+    def _normalize_lane_config(raw_config: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize single-lane and multi-lane configs to one internal shape."""
+        enabled = raw_config.get("enabled", False)
+        zones = []
+        for index, zone in enumerate(raw_config.get("zones", [])):
+            zones.append(
+                {
+                    "name": zone.get("name", f"lane_{index + 1}"),
+                    "roi_points": zone.get("roi_points", []),
+                    "direction": zone.get("direction"),
                 }
+            )
+
+        if enabled and not zones:
+            zones.append(
+                {
+                    "name": "default",
+                    "roi_points": raw_config.get("roi_points", []),
+                    "direction": raw_config.get("direction"),
+                }
+            )
+
+        return {
+            "enabled": enabled,
+            "zones": zones,
+        }
+
+    @staticmethod
+    def _zone_state_key(stream_name: str, zone_name: str) -> str:
+        """Build the internal state key for one lane zone."""
+        return f"{stream_name}::{zone_name}"
+
+    def _process_zone(
+        self,
+        stream_name: str,
+        zone_name: str,
+        zone_direction: Optional[str],
+        enabled_event_types: Optional[set[str]],
+        disabled_event_types: Optional[set[str]],
+        detections: List[Tuple[int, float, Tuple[float, float, float, float]]],
+        frame: np.ndarray,
+        frame_number: int,
+        timestamp: datetime,
+    ) -> List[IncidentEvent]:
+        """Run tracking and event detection for one zone."""
+        zone_state_key = self._zone_state_key(stream_name, zone_name)
+        if zone_state_key not in self.trackers:
+            self.trackers[zone_state_key] = ObjectTracker(
+                max_disappeared=5,
+                max_distance=50.0,
+            )
+
+        tracker_detections = [(class_id, bbox) for class_id, _, bbox in detections]
+        tracked_objects = self.trackers[zone_state_key].update(
+            tracker_detections,
+            frame_number,
+        )
+
+        events = self.event_detector.process_frame(
+            detections=detections,
+            tracked_objects=tracked_objects,
+            stream_name=zone_state_key,
+            frame_number=frame_number,
+            timestamp=timestamp,
+            frame_width=frame.shape[1] if frame is not None else None,
+            frame_height=frame.shape[0] if frame is not None else None,
+            lane_direction=zone_direction,
+            enabled_event_types=enabled_event_types,
+            disabled_event_types=disabled_event_types,
+        )
+
+        for event in events:
+            event.stream_name = stream_name
+            event.metadata["lane_zone"] = zone_name
+            event.metadata["lane_direction"] = zone_direction
+
+        return events
 
     def _analyze_frame(
         self, stream_name: str, frame: np.ndarray, frame_number: int, timestamp: datetime
@@ -361,33 +450,45 @@ class HighwayIncidentDetectionSystem:
     ) -> List[IncidentEvent]:
         """Run post-inference per-stream processing in frame order."""
         lane_config = self.lane_configs.get(stream_name, {})
-        if lane_config.get("enabled", False):
-            roi_points = lane_config.get("roi_points", [])
-            if roi_points:
-                detections = filter_detections_by_roi(detections, roi_points)
-
-        if stream_name not in self.trackers:
-            self.trackers[stream_name] = ObjectTracker(
-                max_disappeared=5,
-                max_distance=50.0,
-            )
-
-        tracker_detections = [(class_id, bbox) for class_id, _, bbox in detections]
-        tracked_objects = self.trackers[stream_name].update(
-            tracker_detections,
-            frame_number,
+        event_filter = self.stream_event_filters.get(
+            stream_name,
+            {"enabled": None, "disabled": None},
         )
-
         with self._event_detector_lock:
-            events = self.event_detector.process_frame(
-                detections=detections,
-                tracked_objects=tracked_objects,
-                stream_name=stream_name,
-                frame_number=frame_number,
-                timestamp=timestamp,
-                frame_width=frame.shape[1] if frame is not None else None,
-                frame_height=frame.shape[0] if frame is not None else None,
-            )
+            if lane_config.get("enabled", False) and lane_config.get("zones"):
+                events: List[IncidentEvent] = []
+                for zone in lane_config["zones"]:
+                    zone_detections = detections
+                    if zone.get("roi_points"):
+                        zone_detections = filter_detections_by_roi(
+                            detections,
+                            zone["roi_points"],
+                        )
+                    events.extend(
+                        self._process_zone(
+                            stream_name=stream_name,
+                            zone_name=zone["name"],
+                            zone_direction=zone.get("direction"),
+                            enabled_event_types=event_filter["enabled"],
+                            disabled_event_types=event_filter["disabled"],
+                            detections=zone_detections,
+                            frame=frame,
+                            frame_number=frame_number,
+                            timestamp=timestamp,
+                        )
+                    )
+            else:
+                events = self._process_zone(
+                    stream_name=stream_name,
+                    zone_name="default",
+                    zone_direction=None,
+                    enabled_event_types=event_filter["enabled"],
+                    disabled_event_types=event_filter["disabled"],
+                    detections=detections,
+                    frame=frame,
+                    frame_number=frame_number,
+                    timestamp=timestamp,
+                )
 
         self.summary_generator.add_frame(stream_name, frame, frame_number, timestamp)
         return events

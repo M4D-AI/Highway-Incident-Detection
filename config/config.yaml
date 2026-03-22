@@ -1,7 +1,7 @@
 # Highway Incident Detection System Configuration
 
 yolo:
-  model_path: "yolov8n.pt"
+  model_path: "yolov8x13.pt"
   confidence_threshold: 0.5
   iou_threshold: 0.45
   device: "cpu"  # "cuda", "mps" or "cpu"
@@ -15,17 +15,22 @@ yolo:
   batch_queue_size: 32
 
 event:
-  construction_vehicle_class_ids: [2, 3, 5, 7]  # car, motorcycle, bus, truck
-  worker_class_id: 0  # person
-  motorcycle_class_id: 3
-  pedestrian_class_id: 0  # person
-  debris_class_ids: [24, 25, 26, 27, 28]
+  # yolov8x13.pt classes:
+  # 0 car, 1 construction-vehicle, 2 bus, 3 truck, 4 container-lorry, 5 tanker,
+  # 6 motocycle, 7 worker, 8 person, 9 helmet, 10 reflective-vest, 11 traffic-cone, 12 rubbish
+  vehicle_class_ids: [0, 2, 3, 4, 5]
+  construction_vehicle_class_ids: [1, 9, 10, 11]
+  worker_class_id: 7
+  construction_require_worker: false
+  motorcycle_class_id: 6
+  pedestrian_class_id: 8
+  debris_class_ids: [12]
   construction_detection_frames: 10
   reverse_detection_frames: 15
   reverse_speed_threshold: -0.5
   event_cooldown_seconds: 30
   # Abnormal parking detection
-  parking_detection_frames: 60  # Frames vehicle must be stationary
+  parking_detection_frames: 8  # Frames configured vehicle classes must be stationary
   parking_speed_threshold: 0.5  # Max speed to consider stationary
   parking_position_threshold: 10.0  # Max position change to consider stationary
   # Congestion detection
@@ -46,18 +51,38 @@ stream:
       url: "data/parking.mp4"
       # url: "rtsp://example.com/stream1"
       enabled: true
-      # Lane configuration for this stream (optional, overrides global lane config)
+      disabled_event_types: ["reverse_vehicle"]
       lane:
-        enabled: false  # Enable ROI filtering for this stream
-        # ROI polygon points: [(x1, y1), (x2, y2), (x3, y3), ...]
-        # Empty list means use full frame
-        roi_points: []  # Example: [[100, 100], [500, 100], [500, 400], [100, 400]]
-        # Lane direction: "left", "right", "up", "down", or null for bidirectional
-        direction: null
+        enabled: true
+        zones:
+          - name: "main_right"
+            # Main near-side carriageway, trimmed more aggressively to suppress far-distance false alarms.
+            roi_points: [[260, 339], [510, 339], [490, 168], [430, 170], [332, 238]]
+            direction: "right"
+          - name: "ramp_right"
+            # Right-side diverging ramp; keep only the nearer section and drop the far merge tip.
+            roi_points: [[510, 339], [639, 339], [639, 140], [575, 135], [490, 168]]
+            direction: "right"
+          - name: "far_left"
+            # Opposite carriageway, trimmed very aggressively to drop most far-distance traffic.
+            roi_points: [[0, 192], [250, 192], [438, 154], [438, 126], [210, 132], [0, 150]]
+            direction: "left"
     - name: "stream_2"
       url: "data/trash.mp4"
 #      url: "rtsp://example.com/stream2"
       enabled: true
+      enabled_event_types: ["road_debris"]
+      lane:
+        enabled: true
+        zones:
+          - name: "near_right"
+            # Near-side carriageway in the lower-left half, widened a bit for left-side debris.
+            roi_points: [[0, 339], [470, 339], [328, 156], [0, 156]]
+            direction: "right"
+          - name: "far_left"
+            # Opposite carriageway across the median, widened slightly toward the left and downward.
+            roi_points: [[128, 184], [639, 184], [639, 12], [292, 12]]
+            direction: "left"
   frame_skip: 1
   buffer_size: 30
   reconnect_interval: 5
@@ -67,7 +92,7 @@ stream:
   no_frame_timeout: 60  # Timeout for no frames received (seconds)
   auto_reconnect: true  # Enable automatic reconnection
   max_pending_frames: 2  # Max in-flight frame processing tasks per stream
-  drop_frames_when_busy: true  # Drop latest frames under sustained backpressure
+  drop_frames_when_busy: false  # Drop latest frames under sustained backpressure
 
 output:
   output_dir: "./output"
