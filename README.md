@@ -47,6 +47,15 @@ The repository ships with two local sample videos under [`data/`](data/).
 
 ### Install | 安装
 
+If you clone this repository with large model weights such as `yolov8x13.pt`, install Git LFS first:
+
+如果你要拉取包含 `yolov8x13.pt` 这类大模型文件的仓库，请先安装 Git LFS：
+
+```bash
+git lfs install
+git lfs pull
+```
+
 ```bash
 pip install .
 ```
