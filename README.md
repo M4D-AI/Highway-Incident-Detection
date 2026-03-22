@@ -4,6 +4,10 @@
 >
 > 基于 YOLO 的高速事件检测系统，支持 RTSP / 本地视频、多事件识别、证据落盘、结果外发，以及大模型二次复核。
 
+If this project saves you setup time, helps with a demo, or gives you a usable baseline for roadside video analytics, consider giving it a Star.
+
+如果这个项目帮你节省了搭建时间、支撑了演示，或者给你的道路视频分析提供了一个可用起点，欢迎点一个 Star。
+
 ![Parking Sample](docs/assets/parking_sample.jpg)
 
 ## Why This Project | 项目亮点
