@@ -1,0 +1,147 @@
+# Local GPU config (RTX 2050 4GB): config.yaml with device=cuda, batch off.
+# Highway Incident Detection System Configuration
+
+yolo:
+  model_path: "yolov8x13.pt"
+  confidence_threshold: 0.5
+  iou_threshold: 0.45
+  device: "cuda"  # "cuda", "mps" or "cpu"
+  img_size: 640
+  auto_restart: true  # Enable automatic model restart on failure
+  health_check_interval: 300  # Health check interval in seconds
+  max_failures: 5  # Maximum consecutive failures before restart
+  batch_inference_enabled: false  # Keep off for single-GPU / single-stream; only helps with many streams
+  max_batch_size: 4
+  batch_timeout_ms: 15
+  batch_queue_size: 32
+
+event:
+  # yolov8x13.pt classes:
+  # 0 car, 1 construction-vehicle, 2 bus, 3 truck, 4 container-lorry, 5 tanker,
+  # 6 motocycle, 7 worker, 8 person, 9 helmet, 10 reflective-vest, 11 traffic-cone, 12 rubbish
+  vehicle_class_ids: [0, 2, 3, 4, 5]
+  construction_vehicle_class_ids: [1, 9, 10, 11]
+  worker_class_id: 7
+  construction_require_worker: false
+  motorcycle_class_id: 6
+  pedestrian_class_id: 8
+  debris_class_ids: [12]
+  construction_detection_frames: 10
+  reverse_detection_frames: 15
+  reverse_speed_threshold: -0.5
+  event_cooldown_seconds: 30
+  # Abnormal parking detection
+  parking_detection_frames: 8  # Frames configured vehicle classes must be stationary
+  parking_speed_threshold: 0.5  # Max speed to consider stationary
+  parking_position_threshold: 10.0  # Max position change to consider stationary
+  # Congestion detection
+  congestion_min_vehicles: 5  # Minimum number of vehicles to trigger congestion
+  congestion_speed_threshold: 2.0  # Max average speed (px/frame) to consider congestion
+  congestion_detection_frames: 30  # Frames to confirm congestion
+  congestion_density_threshold: 0.3  # Minimum vehicle density (0.0-1.0)
+  custom_detectors:
+    - name: "smoke_alert_rule"
+      event_type: "smoke_alert"
+      handler: "custom_detectors.smoke:smoke_alert_detector"
+      enabled: false
+      prepend: true
+
+stream:
+  streams:
+    - name: "stream_1"
+      url: "data/parking.mp4"
+      # url: "rtsp://example.com/stream1"
+      enabled: true
+      disabled_event_types: ["reverse_vehicle"]
+      lane:
+        enabled: true
+        # Resolution the roi_points below were drawn on; they are scaled to the real frame size.
+        roi_reference_size: [640, 340]
+        zones:
+          - name: "main_right"
+            # Main near-side carriageway, trimmed more aggressively to suppress far-distance false alarms.
+            roi_points: [[260, 339], [510, 339], [490, 168], [430, 170], [332, 238]]
+            direction: "right"
+          - name: "ramp_right"
+            # Right-side diverging ramp; keep only the nearer section and drop the far merge tip.
+            roi_points: [[510, 339], [639, 339], [639, 140], [575, 135], [490, 168]]
+            direction: "right"
+          - name: "far_left"
+            # Opposite carriageway, trimmed very aggressively to drop most far-distance traffic.
+            roi_points: [[0, 192], [250, 192], [438, 154], [438, 126], [210, 132], [0, 150]]
+            direction: "left"
+    - name: "stream_2"
+      url: "data/trash.mp4"
+#      url: "rtsp://example.com/stream2"
+      enabled: true
+      enabled_event_types: ["road_debris"]
+      lane:
+        enabled: true
+        # Resolution the roi_points below were drawn on; they are scaled to the real frame size.
+        roi_reference_size: [640, 340]
+        zones:
+          - name: "near_right"
+            # Near-side carriageway in the lower-left half, widened a bit for left-side debris.
+            roi_points: [[0, 339], [470, 339], [328, 156], [0, 156]]
+            direction: "right"
+          - name: "far_left"
+            # Opposite carriageway across the median, widened slightly toward the left and downward.
+            roi_points: [[128, 184], [639, 184], [639, 12], [292, 12]]
+            direction: "left"
+  frame_skip: 1
+  buffer_size: 30
+  reconnect_interval: 5
+  max_reconnect_attempts: -1  # -1 for infinite reconnection attempts
+  read_timeout: 10
+  heartbeat_interval: 30  # Heartbeat check interval in seconds
+  no_frame_timeout: 60  # Timeout for no frames received (seconds)
+  auto_reconnect: true  # Enable automatic reconnection
+  max_pending_frames: 2  # Max in-flight frame processing tasks per stream
+  drop_frames_when_busy: false  # Drop latest frames under sustained backpressure
+
+output:
+  output_dir: "./output"
+  keyframe_dir: "./output/keyframes"
+  video_dir: "./output/videos"
+  summary_dir: "./output/summaries"
+  audit_dir: "./output/audits"
+  video_duration_seconds: 10
+  video_fps: 25
+
+audit:
+  enabled: false
+  provider: "openai_compatible"
+  endpoint: null  # Example: "https://api.openai.com/v1/chat/completions"
+  api_key: null  # Recommended: inject from environment instead of plain text
+  model_name: "gpt-4.1-mini"
+  system_prompt: "You are reviewing highway incident detections. Return strict JSON with keys: confirmed, risk_level, confidence, reason, recommended_action."
+  user_prompt_template: "Review the detector result for a highway-monitoring system and decide whether the event is real. Event type: {event_type}. Detector confidence: {confidence:.2f}. Description: {description}. Stream name: {stream_name}. Frame number: {frame_number}. Timestamp: {timestamp}. Metadata: {metadata_json}. Classify risk_level as one of: {risk_levels}. If the evidence is weak, set confirmed to false."
+  system_prompt_path: null  # Optional text file path, overrides system_prompt when set
+  user_prompt_path: null  # Optional text file path, overrides user_prompt_template when set
+  event_prompt_overrides: {}
+  # event_prompt_overrides:
+  #   pedestrian:
+  #     system_prompt: "You only review pedestrian intrusion events and must be conservative."
+  #     user_prompt_template: "Please verify pedestrian intrusion. Stream={stream_name}, frame={frame_number}, evidence={metadata_json}"
+  timeout_seconds: 20
+  max_images: 3
+  sample_video_frames: true
+  min_event_confidence: 0.35
+  save_raw_response: false
+
+logging:
+  log_dir: "./logs"
+  log_level: "INFO"
+  log_rotation: "100 MB"
+  log_retention: "30 days"
+  log_format: "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} | {message}"
+
+# Global lane configuration (used if stream-specific config not provided)
+lane:
+  enabled: false  # Enable lane-based detection (ROI filtering)
+  # ROI polygon points: [(x1, y1), (x2, y2), (x3, y3), ...]
+  # Empty list means use full frame
+  roi_reference_size: null  # [width, height] the points were drawn on; null = use as-is
+  roi_points: []  # Example: [[100, 100], [500, 100], [500, 400], [100, 400]]
+  # Lane direction: "left", "right", "up", "down", or null for bidirectional
+  direction: null

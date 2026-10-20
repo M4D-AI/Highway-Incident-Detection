@@ -4,12 +4,12 @@ yolo:
   model_path: "yolov8x13.pt"
   confidence_threshold: 0.5
   iou_threshold: 0.45
-  device: "cpu"  # "cuda", "mps" or "cpu"
+  device: "cuda"  # "cuda", "mps" or "cpu"
   img_size: 640
   auto_restart: true  # Enable automatic model restart on failure
   health_check_interval: 300  # Health check interval in seconds
   max_failures: 5  # Maximum consecutive failures before restart
-  batch_inference_enabled: false  # Recommended to enable on GPU for multi-stream micro-batching
+  batch_inference_enabled: false  # Keep off for single-GPU / single-stream; only helps with many streams
   max_batch_size: 4
   batch_timeout_ms: 15
   batch_queue_size: 32
@@ -54,6 +54,8 @@ stream:
       disabled_event_types: ["reverse_vehicle"]
       lane:
         enabled: true
+        # Resolution the roi_points below were drawn on; they are scaled to the real frame size.
+        roi_reference_size: [640, 340]
         zones:
           - name: "main_right"
             # Main near-side carriageway, trimmed more aggressively to suppress far-distance false alarms.
@@ -74,6 +76,8 @@ stream:
       enabled_event_types: ["road_debris"]
       lane:
         enabled: true
+        # Resolution the roi_points below were drawn on; they are scaled to the real frame size.
+        roi_reference_size: [640, 340]
         zones:
           - name: "near_right"
             # Near-side carriageway in the lower-left half, widened a bit for left-side debris.
@@ -136,6 +140,7 @@ lane:
   enabled: false  # Enable lane-based detection (ROI filtering)
   # ROI polygon points: [(x1, y1), (x2, y2), (x3, y3), ...]
   # Empty list means use full frame
+  roi_reference_size: null  # [width, height] the points were drawn on; null = use as-is
   roi_points: []  # Example: [[100, 100], [500, 100], [500, 400], [100, 400]]
   # Lane direction: "left", "right", "up", "down", or null for bidirectional
   direction: null

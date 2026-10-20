@@ -272,13 +272,16 @@ class RTSPStreamProcessor:
 
                 # Process frame
                 timestamp = datetime.now()
-                frame_number = self.frame_counters.get(stream_name, 0) + 1
-                self.frame_counters[stream_name] = frame_number
                 self.last_frame_time[stream_name] = timestamp
 
                 has_capacity = await self._wait_for_callback_slot(stream_name)
                 if not has_capacity:
                     continue
+
+                # Number frames only after they are accepted, so dropped frames
+                # never leave gaps in the per-stream sequence.
+                frame_number = self.frame_counters.get(stream_name, 0) + 1
+                self.frame_counters[stream_name] = frame_number
 
                 # Call callback (this should be fast, non-blocking)
                 try:

@@ -57,9 +57,11 @@ class FrameInferenceResult:
 class HighwayIncidentDetectionSystem:
     """Main system class for highway incident detection."""
 
-    def __init__(self, config_path: str = None):
-        """Initialize the system."""
-        if config_path:
+    def __init__(self, config_path: str = None, settings: Optional[Settings] = None):
+        """Initialize the system from a YAML path, a prepared Settings object, or defaults."""
+        if settings is not None:
+            self.settings = settings
+        elif config_path:
             self.settings = Settings.from_yaml(config_path)
         else:
             self.settings = get_settings()
@@ -84,6 +86,7 @@ class HighwayIncidentDetectionSystem:
 
         self.trackers: Dict[str, ObjectTracker] = {}
         self.lane_configs: Dict[str, Dict] = {}
+        self._scaled_zone_cache: Dict[Tuple[str, int, int], List[Dict[str, Any]]] = {}
         self.stream_event_filters: Dict[str, Dict[str, Optional[set[str]]]] = {}
         self._init_lane_configs()
         self._init_stream_event_filters()
@@ -371,7 +374,56 @@ class HighwayIncidentDetectionSystem:
         return {
             "enabled": enabled,
             "zones": zones,
+            "roi_reference_size": raw_config.get("roi_reference_size"),
         }
+
+    def _get_scaled_zones(
+        self,
+        stream_name: str,
+        lane_config: Dict[str, Any],
+        frame_width: int,
+        frame_height: int,
+    ) -> List[Dict[str, Any]]:
+        """Return lane zones with roi_points mapped to the actual frame size.
+
+        roi_points are given in the coordinate space of ``roi_reference_size``
+        ([width, height]). Without a reference size they are used as-is.
+        Results are cached per stream and frame size.
+        """
+        cache_key = (stream_name, frame_width, frame_height)
+        cached = self._scaled_zone_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        reference_size = lane_config.get("roi_reference_size")
+        if reference_size:
+            ref_width, ref_height = reference_size
+            scale_x = frame_width / ref_width
+            scale_y = frame_height / ref_height
+        else:
+            scale_x = scale_y = 1.0
+
+        scaled_zones = []
+        for zone in lane_config["zones"]:
+            points = [
+                (int(round(x * scale_x)), int(round(y * scale_y)))
+                for x, y in zone.get("roi_points") or []
+            ]
+            if any(x > frame_width or y > frame_height for x, y in points):
+                self.logger.warning(
+                    f"Stream {stream_name} zone {zone['name']}: roi_points exceed frame size "
+                    f"{frame_width}x{frame_height}; set lane.roi_reference_size to the "
+                    "resolution the points were drawn on"
+                )
+            scaled_zones.append({**zone, "roi_points": points})
+
+        if reference_size and tuple(reference_size) != (frame_width, frame_height):
+            self.logger.info(
+                f"Stream {stream_name}: scaled lane ROI from "
+                f"{reference_size[0]}x{reference_size[1]} to {frame_width}x{frame_height}"
+            )
+        self._scaled_zone_cache[cache_key] = scaled_zones
+        return scaled_zones
 
     @staticmethod
     def _zone_state_key(stream_name: str, zone_name: str) -> str:
@@ -457,7 +509,10 @@ class HighwayIncidentDetectionSystem:
         with self._event_detector_lock:
             if lane_config.get("enabled", False) and lane_config.get("zones"):
                 events: List[IncidentEvent] = []
-                for zone in lane_config["zones"]:
+                zones = self._get_scaled_zones(
+                    stream_name, lane_config, frame.shape[1], frame.shape[0]
+                )
+                for zone in zones:
                     zone_detections = detections
                     if zone.get("roi_points"):
                         zone_detections = filter_detections_by_roi(
@@ -556,10 +611,8 @@ class HighwayIncidentDetectionSystem:
             return []
 
         images = [item.frame for item in batch]
-        with self._inference_lock:
-            if len(images) == 1:
-                return [self.yolo_model.predict(images[0], verbose=False)]
-            detections_by_frame = self.yolo_model.predict_batch(images, verbose=False)
+        # Run in a worker thread so GPU inference does not block the event loop.
+        detections_by_frame = await asyncio.to_thread(self._predict_images, images)
 
         if len(detections_by_frame) != len(batch):
             self.logger.warning(
@@ -573,14 +626,40 @@ class HighwayIncidentDetectionSystem:
 
         return detections_by_frame
 
+    def _predict_images(
+        self,
+        images: List[np.ndarray],
+    ) -> List[List[Tuple[int, float, Tuple[float, float, float, float]]]]:
+        """Synchronous model call for one batch (runs in a worker thread)."""
+        with self._inference_lock:
+            if len(images) == 1:
+                return [self.yolo_model.predict(images[0], verbose=False)]
+            return self.yolo_model.predict_batch(images, verbose=False)
+
     async def _drain_ready_stream_results(self, stream_name: str) -> None:
-        """Process ready inference results for one stream in strict frame order."""
+        """Process ready inference results for one stream in frame order.
+
+        A single batch loop consumes the FIFO inference queue, so results for one
+        stream arrive in increasing frame order. A missing frame number (e.g. its
+        batch failed) will therefore never arrive, and is skipped instead of
+        stalling the stream forever.
+        """
         stream_lock = self._stream_locks.setdefault(stream_name, threading.Lock())
         pending_results = self._pending_inference_results.setdefault(stream_name, {})
         next_frame = self._next_frame_to_process.setdefault(stream_name, 1)
         loop = asyncio.get_running_loop()
 
-        while next_frame in pending_results:
+        for stale_frame in [n for n in pending_results if n < next_frame]:
+            pending_results.pop(stale_frame)
+
+        while pending_results:
+            frame_number = min(pending_results)
+            if frame_number != next_frame:
+                self.logger.warning(
+                    f"Stream {stream_name}: frames {next_frame}-{frame_number - 1} "
+                    "have no inference result, skipping"
+                )
+            next_frame = frame_number
             inference_result = pending_results.pop(next_frame)
             postprocess_wait_ms = max(
                 0.0,
