@@ -301,6 +301,13 @@ class LaneConfig(BaseSettings):
         default_factory=list,
         description="Optional multiple lane zones, each with its own ROI and direction"
     )
+    roi_reference_size: Optional[Tuple[int, int]] = Field(
+        default=None,
+        description=(
+            "[width, height] of the image roi_points were drawn on. ROI points are "
+            "scaled to the actual frame size at runtime. None = use points as-is"
+        )
+    )
 
     model_config = SettingsConfigDict(extra="forbid")
 
